@@ -3,3 +3,13 @@
 .RData
 .Ruserdata
 *.Rproj
+*.docx
+*.xlsx
+*.dta
+*.zip
+*.RData
+figures
+shiny
+protocol
+meetings
+archive
