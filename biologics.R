@@ -1,98 +1,8 @@
-# 20260401
-# Clean using new biologics dataset
-
-bx_cln <- biologics_labelled |>
-  rename_with(
-    .cols = contains("bio_"),
-    ~ str_replace(., "bio_", "bx_")
-  ) |>
-  mutate(
-    bx_name_short = structure(
-      factor(
-        str_trim(str_remove(bx_name, " \\(.*\\)$")),
-        levels = c(
-          "Benralizumab",
-          "Mepolizumab",
-          "Reslizumab",
-          "Dupilumab",
-          "Omalizumab",
-          "Tezepelumab"
-        )
-      ),
-      label = "Biologic name"
-    ),
-    bx_type = structure(
-      case_when(
-        bx_name_short %in% c("Mepolizumab", "Reslizumab") ~ "Anti-IL5",
-        bx_name_short %in% c("Benralizumab") ~ "Anti-IL5R",
-        bx_name_short == "Omalizumab" ~ "Anti-IgE",
-        bx_name_short == "Dupilumab" ~ "Anti-IL4Ralpha",
-        bx_name_short == "Tezepelumab" ~ "Anti-TSLP"
-      ) |>
-        factor(
-          levels = c(
-            "Anti-IL5",
-            "Anti-IL5R",
-            "Anti-IL4Ralpha",
-            "Anti-IgE",
-            "Anti-TSLP"
-          ),
-          labels = c(
-            "Anti-IL5",
-            "Anti-IL5R",
-            "Anti-IL4Ralpha",
-            "Anti-IgE",
-            "Anti-TSLP"
-          )
-        ),
-      label = "Biologic class"
-    )
-  ) |>
-  relocate(bx_name_short, bx_type, .after = bx_name) |>
-  #   Reverse imputation for now
-  mutate(
-    # bx_start_date = structure(
-    #   case_when(
-    #     bx_stdate_imputed_flag == "Date missing, visit date imputed" ~ NA,
-    #     TRUE ~ bx_stdate
-    #   ),
-    #   label = "Biologic start date"
-    # ),
-    # bx_end_date = structure(
-    #   case_when(
-    #     bx_endate_imputed_flag ==
-    #       "New prescription at next visit, next prescription start date imputed" ~ NA,
-    #     TRUE ~ bx_endate
-    #   ),
-    #   label = "Biologic end date"
-    # ),
-    #   Exclude imputed months AND days
-    exclude_imp_date = case_when(
-      bx_stdate_imputed_flag == "MonthsDays" ~ TRUE,
-      bx_endate_imputed_flag == "MonthsDays" ~ TRUE
-    ),
-    bx_flag = TRUE
-  ) |>
-  group_by(patient_id) |>
-  # fill(c("exclude_imp_date")) |>
-  ungroup() |>
-  rename(bx_start_date = bx_stdate, bx_end_date = bx_endate)
-#   Imputed dates reverted to missing, only accepting imputed days within month for dates
-#   Drop imputed flags and keep distinct rows
-# select(-contains("imputed"))  #n=51747
+# 20260803
+# Assemble biologics dataset
 
 ## Analysis ----
-# 23480 patients without biologic data
-patient_labelled |>
-  anti_join(bx_cln, by = "patient_id") |>
-  nrow()
-# 0 patients in biologic data without patient data
-bx_cln |>
-  anti_join(patient_labelled, by = "patient_id") |>
-  distinct(patient_id) |>
-  nrow()
-
-bx_err <- patient_labelled |>
+bx_cln <- patient_labelled |>
   remove_empty_imputation_fields() |>
   select(-data_capture_system) |>
   #   Demographics - add age and index_date, confirm the latter
@@ -252,7 +162,7 @@ bx_err <- patient_labelled |>
   ungroup()
 
 # Check that index date aligns with first biologic date
-bx_err |>
+bx_cln |>
   mutate(
     index_year = year(index_date),
     index_year_chk = first(bx_start_year),
@@ -260,7 +170,7 @@ bx_err |>
   ) |>
   filter(index_year != index_year_chk) # empty set
 
-error_summary <- bx_err |>
+error_summary <- bx_cln |>
   distinct(patient_id, .keep_all = T) |>
   filter(errors != "") |>
   select(-errors) |>
@@ -279,7 +189,7 @@ error_summary |>
 error_summary |> view()
 
 # Biologic history ----
-bx_history <- bx_err |>
+bx_history <- bx_cln |>
   # Drop patients with errors
   filter(
     exclusions == "Eligible" |
