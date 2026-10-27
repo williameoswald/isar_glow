@@ -61,7 +61,7 @@ library(ISARanalysis)
 # Type pp + tab to paste copied filepath using snippet
 datapath <- "C:/Users/william.oswald/Optimum Patient Care Global Limited/ISAR Team - Documents/Dataset production"
 # The latest folder with a date name is the same as "latest", use dated folder for a useful version tag in dataset
-versiondate <- "20260603"
+versiondate <- "20260805"
 
 # FUNCTIONS ----
 
