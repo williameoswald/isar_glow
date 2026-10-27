@@ -9,6 +9,7 @@ library(rspiro)
 # Done: spiro, ac, biomarkers, lifestyle, biologics
 # Exacerbation details not provided for UK, can only use exac_num in patient_visits
 # Allergens are not provided for UK (I don't think)
+# 20261027 Incorporated eligibility steps from UK feasibility calcuations and sent data queries to Dom P
 
 # To Do ----
 
@@ -21,7 +22,7 @@ connection <- RODBC::odbcDriverConnect(
                               trusted_connection=true'
 )
 
-gbr_data <- c(
+uk_data <- c(
   "RR_asthma_medications",
   "RR_blood_and_sputum_eosinophils_detail",
   "RR_exacerbation_history_detail",
@@ -51,7 +52,7 @@ gbr_data <- c(
     )
   })
 
-save(gbr_data, file = "qisar2_gbr_data.RData")
+save(gbr_data, file = "qisar2_uk_data.RData")
 
 close(connection)
 
@@ -77,10 +78,10 @@ remove_empty_check_fields <- function(df) {
 }
 
 # Load data ----
-load("qisar2_gbr_data.RData")
+load("qisar2_uk_data.RData")
 
 #Split named list into objects
-list2env(gbr_data, envir = .GlobalEnv)
+list2env(uk_data, envir = .GlobalEnv)
 
 # Drop empty columns for sanity when reviewing DF
 # patient_visits <- patient_visits |>
@@ -1190,3 +1191,21 @@ forreview
 bx_analysis <- bx_cln_exclusions |>
   filter(is.na(exclusions)) |>
   select(-bx_data, -contains("exclusions"), -prior_biologic_chk, -overlap)
+
+# Save SRD output ----
+save(
+  visits,
+  patient_table,
+  lifestyle,
+  comorbidities,
+  allergens,
+  hcru,
+  asthma_control,
+  spirometry_cln,
+  biomarkers,
+  medications,
+  bx_cln,
+  bx_cln_exclusions,
+  bx_analysis,
+  file = "srd_uk_data.Rdata"
+)
