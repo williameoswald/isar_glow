@@ -104,6 +104,8 @@ index_dates <- visit_labelled |>
 ## Analysis ----
 bx_cln <- patient_labelled |>
   filter_out(country == "Denmark") |>
+  filter_out(country == "UK") |>
+  filter_out(str_detect(patient_id, "NJH")) |>
   remove_empty_imputation_fields() |>
   select(-data_capture_system) |>
   left_join(
@@ -302,84 +304,76 @@ error_summary |>
 error_summary |> view()
 
 # Biologic history ----
-bx_history <- bx_cln |>
+bx_analysis <- bx_cln |>
   # Drop patients with errors
   filter(
     when_any(
-      exclusions == "Eligible",
-      exclusions == "Fewer than two biologics available",
-      exclusions == "Biologic start date before 2016",
-      exclusions == "Less than 3 months of follow-up"
+      exclusions == "Eligible"
+      # exclusions == "Fewer than two biologics available",
+      # exclusions == "Biologic start date before 2016",
+      # exclusions == "Less than 3 months of follow-up"
     )
   ) |>
+  relocate(data_capture_system = version, .after = patient_id) |>
   select(
+    -bx_name,
     -bx_flag,
     -contains("err"),
     # -contains("exclu")
   ) |>
   arrange(patient_id, bx_start_date) |>
-  group_by(patient_id) |>
   # Assign earlier end date as subsequent start date in these cases
   mutate(
     bx_nbr = row_number(),
     bx_ct = n(),
-    # Use last visit date where valid for missing end dates
-    bx_end_date2 = case_when(
-      # If 1 bx listed and no end date available, assume on treatment until last visit, unless last visit is before start date
-      bx_ct == 1 &
-        is.na(bx_end_date) &
-        last_visit_date >= bx_start_date ~ last_visit_date, #switched to allow same last visit and start
-      # If last bx and no end date available, assume end date is last visit
-      row_number() == bx_ct &
-        last(is.na(bx_end_date)) &
-        last_visit_date >= bx_start_date ~ last_visit_date, #switched to allow same last visit and start
-      TRUE ~ bx_end_date
+    prev_end_date = dplyr::lag(bx_end_date),
+    gap_months = case_when(
+      bx_nbr > 1 ~ interval(
+        prev_end_date,
+        bx_start_date
+      ) /
+        months(1),
+      .default = NA
     ),
-    # Avoid 0 length intervals by adding 1 day to end
-    bx_end_date2 = if_else(
-      bx_start_date == bx_end_date2,
-      bx_end_date2 + days(1),
-      bx_end_date2
+    gt6mos_gap = bx_nbr == 2 & gap_months > 6,
+    outcome = case_when(
+      all(bx_ct == 1 & is.na(bx_end_date)) ~ "Continue",
+      all(
+        bx_ct == 1 &
+          bx_end_date > last_visit_date %m+% months(1)
+      ) ~ "Continue", # Censored not stop
+      # any(bx_ct == 1 & bx_ongoing == "No" & bx_end_date <= last_visit_date) ~ "Stop",
+      all(
+        bx_ct == 1 &
+          (bx_end_date < last_visit_date |
+            bx_end_date <= last_visit_date %m+% months(1))
+      ) ~ "Stop", # Recorded stop before or within a month of last visit
+      # any(bx_ct > 1 & gt6mos_gap) ~ "Stop", # Drop this for ATS abstract, need to define gap
+      any(bx_ct > 1) ~ "Switch"
     ),
-    # Calculate treatment months
-    tx_months = interval(bx_start_date, bx_end_date2) / months(1),
-    # Add gap in months to allow visualisation
-    # Calculate gap between end of current treatment row and start of next
-    next_bx_start_date = if_else(
-      bx_nbr < bx_ct,
-      dplyr::lead(bx_start_date),
-      NA
+    # Calculate episode length in months
+    episode_months = case_when(
+      outcome == "Continue" ~ interval(bx_start_date, last_visit_date) /
+        months(1),
+      outcome == "Stop" ~ interval(bx_start_date, bx_end_date) / months(1),
+      outcome == "Switch" ~ interval(bx_start_date, bx_end_date) / months(1)
     ),
-    tx_gap = interval(bx_end_date2, next_bx_start_date),
-    tx_gap_months = tx_gap / months(1),
-    # Flag if gap row needs to be added
-    tx_gap_row = coalesce(tx_gap > 0, FALSE),
+    .by = patient_id
   ) |>
-  relocate(c(bx_start_date, bx_end_date2, tx_months), .after = bx_end_date) |>
-  # Duplicate row where treatment gap indicated
-  tidyr::uncount(
-    weights = if_else(tx_gap_row, 2L, 1L),
-    .id = "gap", # specify new column name to indicate "gap" rows
-    .remove = TRUE # remove "weights" column if present, not needed
-  ) |>
-  # Insert gaps into treatment months
-  mutate(
-    tx_months = if_else(gap == 2, tx_gap_months, tx_months),
-    bx_start_date = if_else(
-      gap == 2,
-      dplyr::lag(bx_end_date2),
-      bx_start_date
-    ),
-    bx_end_date2 = if_else(gap == 2, dplyr::lead(bx_start_date), bx_end_date2),
-    bx_type = if_else(gap == 2, "No treatment", bx_type),
-    bx_name = if_else(gap == 2, "Treatment gap", bx_name),
-    bx_name_short = if_else(gap == 2, "Treatment gap", bx_name_short),
-    bx_nbr = if_else(gap == 2, NA, bx_nbr),
-    # Calculate months since index date per treatment and gaps for visualisation
-    start_months = dplyr::lag(cumsum(tx_months), default = 0),
-    end_months = cumsum(tx_months)
-  ) |>
-  ungroup() |>
   arrange(patient_id, bx_start_date)
 
-save(bx_cln, bx_history, file = "biologic_data.RData")
+isar_bx_cln <- bx_cln
+isar_bx_analysis <- bx_analysis |>
+  rename(site = setting) |>
+  mutate(
+    setting = case_when(
+      str_detect(site, "UNC") ~ "USA - UNC",
+      str_detect(site, "Michigan") ~ "USA - Michigan",
+      str_detect(site, "NJH") ~ "USA - NJH",
+      str_detect(site, "Tallaght") ~ "IRL - Tallaght",
+      str_detect(site, "Beaumont") ~ "IRL - Beaumont",
+      .default = country
+    )
+  )
+
+save(isar_bx_cln, isar_bx_analysis, file = "isar_biologic_data.RData")
