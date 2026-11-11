@@ -1,4 +1,4 @@
-# Pull Italy QISAR2 data and process for GLOW analysis
+# Pull Italy QISAR2 data and process for ISAR analysis
 library(RODBC)
 library(tidyverse)
 library(janitor)
@@ -8,7 +8,7 @@ library(janitor)
 # all information and uses all transferred data so things may change. 
 # Worth finishing processing here, so we can make baseline and compare with G's
 # 20261015 Italy provides DOB as YYYY-MM-UNK -> Impute as 15th and calculate
-
+# 20261103 
 
 # !!!!! - Exclude 419 patients with 2="No" for both inclusion criteria?
 
@@ -20,7 +20,7 @@ library(janitor)
 # Comorbidities
 # LTOCS - pending
 
-# Pull NJH data ----
+# Pull Italy data ----
 ## Connect to ISAR SQL tables
 connection <- RODBC::odbcDriverConnect(
   'driver={SQL Server};
@@ -29,7 +29,6 @@ connection <- RODBC::odbcDriverConnect(
                               trusted_connection=true'
 )
 
-# Italy ----
 ita_data <- c(
   "RR_asthma_medications",
   "RR_blood_and_sputum_eosinophils_detail",
@@ -38,7 +37,9 @@ ita_data <- c(
   "RR_patient_visits",
   "RR_spirometry_predicted_values",
   "ST_medications", # Medications as shared by Italy pre-ISAR processing
-  "ST_exitreason" # Lost to follow up flags (Italy only)
+  "ST_exitreason", # Lost to follow up flags (Italy only)
+  "data_dictionary",
+  "data_dictionary_raw"
   ) |>
   set_names(nm = \(x) {
     str_remove(x, "_detail$") |>
@@ -52,6 +53,32 @@ ita_data <- c(
       connection,
       paste0(
         'SELECT * FROM QISAR2.ita.',
+        table
+      ),
+      as.is = T
+    )
+  })
+
+# Neva rebuild
+ita_data2 <- c(
+  "RR_patient",
+  "RR_patient_visits",
+  "RR_asthma_medications",
+  "ST_asthma_medications"
+) |>
+  set_names(nm = \(x) {
+    str_remove(x, "_detail$") |>
+      str_remove("^RR_") |>
+      str_replace("ST_asthma_", "ST_") |>
+      str_remove("^ST_") |>
+      str_remove("_predicted_values$") |>
+      str_to_lower()
+  }) |>
+  map(\(table) {
+    sqlQuery(
+      connection,
+      paste0(
+        'SELECT * FROM isar_staging_source_imports.stg_ita.',
         table
       ),
       as.is = T
@@ -88,6 +115,7 @@ load("qisar2_ita_data.RData")
 
 #Split named list into objects
 list2env(ita_data, envir = .GlobalEnv)
+list2env(ita_data2, envir = .GlobalEnv)
 
 # Dictionary ----
 # variable_list <- ita_data |>
@@ -120,7 +148,11 @@ list2env(ita_data, envir = .GlobalEnv)
 visits <- patient |> 
   # n = 4120, 3 duplicated patient records
   # Italy provides DOB so use this instead of age (not sure where this comes from), with day imputed as 15th
-  distinct(patient_id = uidpat) |>
+  distinct(uidpat, dob) |>
+  mutate(
+    patient_id = structure(uidpat, label = "Patient ID"),
+    date_of_birth = structure(ymd(str_replace(dob, "UNK", "15")), label = "Date of birth, imputed")
+  ) |> 
   # Right join because some patients in visits are missing from patient
   right_join(
     patient_visits |>
@@ -152,22 +184,23 @@ visits <- patient |>
       label = "Visit ID"
     ),
     # Visit dates all plausible and no missing
-    visit_date = structure(ymd(visit_date), label = "Visit date")
+    visit_date = structure(dmy(visit_date), label = "Visit date")
   ) |>
   distinct() |>
   mutate(
     num_of_visits = n(),
     first_visit_date = min(visit_date, na.rm = T),
     last_visit_date = max(visit_date, na.rm = T),
+    age_at_visit = floor(interval(date_of_birth, visit_date) / years(1)),
     .by = patient_id
   ) |>
   mutate(
     num_of_visits = structure(num_of_visits, label = "Number of visits"),
     first_visit_date = structure(first_visit_date, label = "First visit date"),
     last_visit_date = structure(last_visit_date, label = "Last visit date"),
-    # age_at_visit = structure(age_at_visit, label = "Age at visit, years")
+    age_at_visit = structure(age_at_visit, label = "Age at visit, years")
   ) |>
-  # select(-age_first_visit) |>
+  select(-dob, -uidpat) |>
   arrange(patient_id, visit_date)
 
 # Checks
@@ -246,6 +279,7 @@ patient_table <- patient |>
     # Convert height to metres
     ht = structure(as.numeric(ht) / 100, label = "Height, metres"),
     country = structure("Italy", label = "Country"),
+    setting = structure("Italy", label = "Setting"),
     site = structure(dagarm, label = "Site"),
     data_capture_system = structure("Bespoke", label = "Data capture system"),
     first_visit_date = structure(first_visit_date, label = "First visit date"),
@@ -255,6 +289,7 @@ patient_table <- patient |>
   select(
     patient_id,
     country,
+    setting,
     site, # site is different to setting
     first_visit_date,
     last_visit_date,
@@ -910,32 +945,42 @@ medications <- asthma_medications |>
 # Other drugs similarly duplicated
 
 # Medications Supplement ----
-s_medications <- supplement_medications |> 
-  rename(start_date = therapy_start,
-         end_date = therapy_end,
-         name = drug) |> 
-  mutate(
-    drug_type = case_when(
-      drug_type %in% c("antiige", "antiil4", "antiil5", "antitslp") ~ "Biologic",
-      drug_type == "mos" ~ "LTOCS",
-      drug_type == "ics" ~ "ICS only",
-      drug_type == "macrolide" ~ "Macrolides",
-      .default = str_to_upper(drug_type)
-    ),
-    across(contains("date"), ymd)
-  ) |> 
-  filter_out(
-    if_all(c(drug_type, name, ldose, freq, switchreason), is.na)
-    )
+
+
 
 # Biologics ----
+# Use supplement therapy file as provided rather than asthma_medications table
 bx_cln <- medications |> 
-  filter(drug_type == "Biologic") |> 
-  arrange(patient_id, start_date) |> 
-  mutate(bx_ct = n(),
-         bx_nbr = row_number(),
-         bx_name = structure(
-           factor(name,
+  mutate(
+    # patient_id = str_replace(patient_id, "^ITA", "ITA_"),
+    therapy_start = str_replace(therapy_start, "UNK", "15")
+  ) |> 
+  filter(medication_class %in% c("antiige", "antiil4", "antiil5", "antitslp")) |> 
+  select(
+    where(\(x) any(!is.na(x)))
+  ) |> 
+  select(
+    patient_id,
+    bx_start_date = therapy_start,
+    bx_end_date = therapy_end,
+    contains("anti_"),
+    bx_switchreason = biologic_switch_reason,
+    bx_switch_adverse_event_grade = biologic_switch_adverse_event_grade
+  ) |> 
+  # Pivot in case of multiple drugs listed
+  pivot_longer(
+    cols = -c(patient_id, contains("date"), contains("switch")),
+    values_to = "bx_name",
+    names_to = "bx_class"
+  ) |> 
+  filter_out(is.na(bx_name)) |> 
+  mutate(
+    bx_start_date = dmy(bx_start_date),
+    bx_end_date = dmy(bx_end_date)
+  ) |> 
+  arrange(patient_id, bx_start_date) |> 
+  mutate(bx_name_short = structure(
+           factor(str_trim(str_remove(bx_name, " \\(.*\\)$")),
              levels = c(
                "Benralizumab",
                "Dupilumab",
@@ -949,11 +994,11 @@ bx_cln <- medications |>
          ),
          bx_type = structure(
            case_when(
-             bx_name %in% c("Mepolizumab", "Reslizumab") ~ "Anti-IL5",
-             bx_name %in% c("Benralizumab") ~ "Anti-IL5R",
-             bx_name == "Omalizumab" ~ "Anti-IgE",
-             bx_name == "Dupilumab" ~ "Anti-IL4Ralpha",
-             bx_name == "Tezepelumab" ~ "Anti-TSLP"
+             bx_name_short %in% c("Mepolizumab", "Reslizumab") ~ "Anti-IL5",
+             bx_name_short %in% c("Benralizumab") ~ "Anti-IL5R",
+             bx_name_short == "Omalizumab" ~ "Anti-IgE",
+             bx_name_short == "Dupilumab" ~ "Anti-IL4Ralpha",
+             bx_name_short == "Tezepelumab" ~ "Anti-TSLP"
            ) |>
              factor(
                levels = c(
@@ -974,28 +1019,221 @@ bx_cln <- medications |>
            label = "Biologic class"
          ),
          bx_ongoing = structure(
-           if_else(is.na(end_date), "Yes", "No") |> 
+           if_else(is.na(bx_end_date), "Yes", "No") |> 
              factor(levels = c("Yes", "No")),
            label = "Biologic ongoing"
          ),
-         reason_no_clinical_efficacy = str_detect(switchreason, "No clinical efficacy"),
-         reason_patients_choice = str_detect(switchreason, "Patient's choice"),
-         reason_side_effects = str_detect(switchreason, "Side effects"),
-         reason_access_restriction = str_detect(switchreason, "Restrictions on access to biological drugs"),
+         # reason_no_clinical_efficacy = str_detect(switchreason, "No clinical efficacy"),
+         # reason_patients_choice = str_detect(switchreason, "Patient's choice"),
+         # reason_side_effects = str_detect(switchreason, "Side effects"),
+         # reason_access_restriction = str_detect(switchreason, "Restrictions on access to biological drugs"),
          .by = patient_id) |> 
-  select(patient_id, contains("date"), bx_ongoing, bx_ct, bx_nbr, bx_name, bx_type, contains("reason_"))
+  select(patient_id, 
+         bx_start_date,
+         bx_end_date,
+         bx_ongoing, 
+         bx_name_short, 
+         bx_type, 
+         bx_switchreason) |>
+  left_join(
+    patient_table |>
+      select(
+        patient_id,
+        data_capture_system,
+        country,
+        setting,
+        site,
+        first_visit_date,
+        last_visit_date,
+        num_of_visits
+      ),
+    by = join_by(patient_id),
+    relationship = "many-to-one"
+  ) |>
+  relocate(
+    data_capture_system,
+    country,
+    setting,
+    site,
+    contains("visit"),
+    .after = patient_id
+  )
+
+## Exclusions ----
+# Based on those used for UK
+bx_cln_exclusions <- patient |>
+  distinct(patient_id = uidpat) |>
+  left_join(
+    bx_cln |>
+      mutate(bx_data = TRUE),
+    by = join_by(patient_id)
+  ) |>
+  arrange(patient_id, bx_start_date) |>
+  mutate(
+    # Look at overlaps (1 day probably okay)
+    overlap = interval(
+      dplyr::lag(bx_end_date, default = first(bx_start_date)),
+      bx_start_date
+    ) /
+      days(1) <
+      -1,
+    first_biologic = bx_start_date == min(bx_start_date),
+    follow_up_mos = interval(bx_start_date, last_visit_date) / months(1),
+    exclusions = case_when(
+      all(is.na(bx_data)) ~ "No biologic information",
+      any(is.na(bx_name_short)) ~ "Missing biologic name",
+      any(is.na(bx_start_date)) ~ "Missing start date",
+      # prior_biologic_chk == "prior biologic not listed" ~ "Non-biologic naive",
+      n_distinct(bx_start_date) < n() ~ "Duplicate start dates",
+      any(bx_end_date < bx_start_date) ~ "End date before start date",
+      all(bx_start_date > last_visit_date) ~ "All future treatments",
+      any(bx_start_date > last_visit_date) ~ "Any future treatments",
+      # any(is.na(bx_end_date)) ~ "Missing end date", # Missing end date currently ongoing tx...
+      any(overlap) ~ "Overlapping episodes (>1 day)",
+      any(
+        first_biologic & year(bx_start_date) < 2016
+      ) ~ "Started biologic before 2016",
+      any(
+        first_biologic & follow_up_mos < 3
+      ) ~ "<3 months post-initiation follow-up",
+      .default = NA
+    ) |>
+      factor(
+        levels = c(
+          "No biologic information",
+          "Missing biologic name",
+          "Missing start date",
+          "Non-biologic naive",
+          "Duplicate start dates",
+          "End date before start date", #Look like imputations
+          "All future treatments",
+          "Any future treatments",
+          "Missing end date",
+          "Overlapping episodes (>1 day)",
+          "Started biologic before 2016",
+          "<3 months post-initiation follow-up"
+        )
+      ),
+    exclusions_table = case_when(
+      exclusions == "No biologic information" ~ "No biologic information",
+      exclusions == "Non-biologic naive" ~ "Non-biologic naive",
+      exclusions ==
+        "Started biologic before 2016" ~ "Started biologic before 2016",
+      exclusions ==
+        "<3 months post-initiation follow-up" ~ "<3 months post-initiation follow-up",
+      # exclusions == "<11 months post-initiation follow-up" ~ "Eligible",
+      is.na(exclusions) ~ "Eligible",
+      .default = "Data queries"
+    ) |>
+      factor(
+        levels = c(
+          "No biologic information",
+          "Non-biologic naive",
+          "Data queries",
+          "Started biologic before 2016",
+          "<3 months post-initiation follow-up",
+          "Eligible"
+        )
+      ),
+    .by = patient_id
+  )
+
+bx_cln_exclusions |>
+  distinct(patient_id, exclusions) |>
+  tabyl(exclusions) |>
+  adorn_totals() |>
+  arrange(!exclusions == "Total")
+
+bx_cln_exclusions |>
+  distinct(patient_id, exclusions_table) |>
+  tabyl(exclusions_table) |>
+  adorn_totals() |>
+  arrange(!exclusions_table == "Total")
+
+## Analysis table ----
+bx_analysis <- bx_cln_exclusions |>
+  filter(is.na(exclusions)) |>
+  select(-bx_data, -contains("exclusions"), -overlap) |>
+  # ITA outcome =
+  # ITA continuers: 1 biologic episode, flagged as ongoing, or stop indicated more than a month after last visit
+  # ITA stoppers: 1 biologic episode, flagged as stopped before or within a month of last visit; >1 biologic and gap between 1st and 2nd >6 months
+  # ITA switchers: >1 biologic episode, <=6 months between 1 and 2nd
+  mutate(
+    index_date = min(bx_start_date),
+    follow_up_mos = interval(index_date, last_visit_date) / months(1),
+    bx_ct = n(),
+    bx_nbr = row_number(),
+    prev_end_date = dplyr::lag(bx_end_date),
+    gap_months = case_when(
+      bx_nbr > 1 ~ interval(
+        prev_end_date,
+        bx_start_date
+      ) /
+        months(1),
+      .default = NA
+    ),
+    gt6mos_gap = bx_nbr == 2 & gap_months > 6,
+    outcome = case_when(
+      all(bx_ct == 1 & bx_ongoing == "Yes") ~ "Continue", # all end dates same as last visit date
+      all(
+        bx_ct == 1 &
+          bx_ongoing == "No" &
+          bx_end_date > last_visit_date %m+% months(1)
+      ) ~ "Continue", # Censored not stop
+      # any(bx_ct == 1 & bx_ongoing == "No" & bx_end_date <= last_visit_date) ~ "Stop",
+      all(
+        bx_ct == 1 &
+          bx_ongoing == "No" &
+          (bx_end_date < last_visit_date |
+             bx_end_date <= last_visit_date %m+% months(1))
+      ) ~ "Stop", # Recorded stop before or within a month of last visit
+      # any(bx_ct > 1 & gt6mos_gap) ~ "Stop", # Drop this for ATS abstract, need to define gap
+      any(bx_ct > 1) ~ "Switch"
+    ),
+    # Calculate episode length in months
+    episode_months = case_when(
+      outcome == "Continue" ~ interval(bx_start_date, last_visit_date) /
+        months(1),
+      outcome == "Stop" ~ interval(bx_start_date, bx_end_date) / months(1),
+      outcome == "Switch" ~ interval(bx_start_date, bx_end_date) / months(1)
+    ),
+    .by = patient_id
+  )
+
+save(
+  bx_cln,
+  bx_cln_exclusions,
+  bx_analysis,
+  file = "ita_biologic_data.Rdata"
+)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 single <- bx_cln |> 
   filter(bx_ct == 1)
 
 # Of patients with end dates, 50% have switch reasons
 # Assume they remain on treatment, unless there's an end date? Or assume they stop only where there's a switchreason?
-single |> filter(!is.na(end_date)) |> tabyl(switchreason)
+single |> filter(!is.na(bx_end_date)) |> tabyl(bx_switchreason)
 
 multiple <- bx_cln |> 
   filter(bx_ct > 1) |> 
   mutate(
-    benra_reliever = !is.na(end_date) & bx_name %in% "Benralizumab" & start_date==end_date
+    benra_reliever = !is.na(bx_end_date) & bx_name_short %in% "Benralizumab" & bx_start_date==bx_end_date
   ) |> 
   group_by(patient_id) 
 keys  <- multiple |> group_keys() |> pull(patient_id)
