@@ -8,9 +8,16 @@ library(janitor)
 # all information and uses all transferred data so things may change. 
 # Worth finishing processing here, so we can make baseline and compare with G's
 # 20261015 Italy provides DOB as YYYY-MM-UNK -> Impute as 15th and calculate
-# 20261103 
+# 20261111 Neva has completed rebuild for QISAR2, will incorporate 
 
 # !!!!! - Exclude 419 patients with 2="No" for both inclusion criteria?
+# 20261111 NE - processing (based on what was done previously as well) just assumes step 4 
+# for those who are not on biologics or OCS. They may not have step 4 level 
+# medication or uncontrolled act/acq/gina or 2+ exacs recorded. They ask separate 
+# questions on their dictionary that specifically checks if a patient is on Gina 
+# step 4 and uncontrolled (you can refer to the excel in the email!). 
+# Means they should be technically included but then queried as to why their 
+# meds and/or asthma control don’t show the same.
 
 # To Do ----
 # Medications - probably better use supplement table
@@ -30,20 +37,24 @@ connection <- RODBC::odbcDriverConnect(
 )
 
 ita_data <- c(
+  "RR_allergens",
+  "RR_asthma_control",
   "RR_asthma_medications",
-  "RR_blood_and_sputum_eosinophils_detail",
+  "RR_biomarkers",
+  "RR_comorbidities",
   "RR_exacerbation_history_detail",
   "RR_patient",
   "RR_patient_visits",
   "RR_spirometry_predicted_values",
-  "ST_medications", # Medications as shared by Italy pre-ISAR processing
-  "ST_exitreason", # Lost to follow up flags (Italy only)
+  "ST_asthma_medications",
+  "ST_exits_reason",
   "data_dictionary",
   "data_dictionary_raw"
   ) |>
   set_names(nm = \(x) {
     str_remove(x, "_detail$") |>
       str_remove("^RR_") |>
+      str_replace("ST_asthma_", "ST_") |>
       str_remove("^ST_") |>
       str_remove("_predicted_values$") |>
       str_to_lower()
@@ -53,32 +64,6 @@ ita_data <- c(
       connection,
       paste0(
         'SELECT * FROM QISAR2.ita.',
-        table
-      ),
-      as.is = T
-    )
-  })
-
-# Neva rebuild
-ita_data2 <- c(
-  "RR_patient",
-  "RR_patient_visits",
-  "RR_asthma_medications",
-  "ST_asthma_medications"
-) |>
-  set_names(nm = \(x) {
-    str_remove(x, "_detail$") |>
-      str_remove("^RR_") |>
-      str_replace("ST_asthma_", "ST_") |>
-      str_remove("^ST_") |>
-      str_remove("_predicted_values$") |>
-      str_to_lower()
-  }) |>
-  map(\(table) {
-    sqlQuery(
-      connection,
-      paste0(
-        'SELECT * FROM isar_staging_source_imports.stg_ita.',
         table
       ),
       as.is = T
@@ -115,53 +100,22 @@ load("qisar2_ita_data.RData")
 
 #Split named list into objects
 list2env(ita_data, envir = .GlobalEnv)
-list2env(ita_data2, envir = .GlobalEnv)
-
-# Dictionary ----
-# variable_list <- ita_data |>
-#   imap(\(table, tablename) {
-#     vars <- names(table)
-# 
-#     vars |>
-#       map(\(var) {
-#         vals <- unique(table[[var]])
-#         tibble(
-#           qisar2_table = tablename,
-#           qisar2_variable = var,
-#           qisar2_values = paste(
-#             if (length(vals) < 5) vals else vals[1:5],
-#             collapse = ", "
-#           )
-#         )
-#       }) |>
-#       list_rbind()
-#   }) |>
-#   list_rbind() |>
-#   mutate(
-#     n = row_number(),
-#     .by = qisar2_table
-#   )
-# 
-# write_xlsx(variable_list, "qisar2_ita_data_dictionary.xlsx")
 
 # Visits ----
 visits <- patient |> 
-  # n = 4120, 3 duplicated patient records
+  # n = 4138
   # Italy provides DOB so use this instead of age (not sure where this comes from), with day imputed as 15th
   distinct(uidpat, dob) |>
   mutate(
     patient_id = structure(uidpat, label = "Patient ID"),
-    date_of_birth = structure(ymd(str_replace(dob, "UNK", "15")), label = "Date of birth, imputed")
+    date_of_birth = structure(ymd(str_replace(dob, "UNK", "15")), label = "Date of birth, imputed as 15th")
   ) |> 
-  # Right join because some patients in visits are missing from patient
-  right_join(
+  # Right join because some patients in visits are missing from patient - fixed
+  left_join(
     patient_visits |>
-      select(
-        patient_id = uidpat,
-        visit_date = dov,
-        uidpatvis
-      ) |>
-      distinct(),
+      distinct(patient_id = uidpat,
+               visit_date = dov,
+               uidpatvis),
     by = join_by(patient_id)
   ) |>
   mutate(
@@ -186,7 +140,6 @@ visits <- patient |>
     # Visit dates all plausible and no missing
     visit_date = structure(dmy(visit_date), label = "Visit date")
   ) |>
-  distinct() |>
   mutate(
     num_of_visits = n(),
     first_visit_date = min(visit_date, na.rm = T),
@@ -203,7 +156,7 @@ visits <- patient |>
   select(-dob, -uidpat) |>
   arrange(patient_id, visit_date)
 
-# Checks
+# Check visit ID versus date order - fixed 
 visits_chks <- visits |>
   mutate(
     visit_order = case_when(
@@ -218,7 +171,7 @@ visits_chks <- visits |>
   arrange(patient_id, visit_date) |>
   mutate(date_order = row_number() - 1, .by = patient_id)
 
-# 69 patients with visits out of order
+# 69 patients with visits out of order - fixed
 visits_chks |>
   filter(visit_order != date_order) |>
   distinct(patient_id) |>
@@ -246,7 +199,6 @@ visits_chks |>
 # Patient table ----
 # Patient-level, i.e. non-varying details, no separate Demographic table
 patient_table <- patient |> 
-  # n = 4120, 3 duplicated patient records
   distinct(patient_id = uidpat, site = dagarm, .keep_all = TRUE) |>
   # Drop empty fields
   select(
@@ -262,7 +214,8 @@ patient_table <- patient |>
       distinct(patient_id,
              first_visit_date,
              last_visit_date,
-             num_of_visits),
+             num_of_visits,
+             date_of_birth),
     by = join_by(patient_id),
     relationship = "one-to-one"
   ) |>
@@ -271,13 +224,10 @@ patient_table <- patient |>
       factor(gen, levels = c("Male", "Female")),
       label = "Gender"
     ),
-    date_of_birth = structure(ymd(str_replace(dob, "UNK", "15")),
-                              label = "Date of birth, day imputed"
-    ),
     ethnicity = structure(eth, label = "Ethnicity"),
     asthma_onset = structure(as.numeric(asmage), label = "Age at asthma onset, years"),
     # Convert height to metres
-    ht = structure(as.numeric(ht) / 100, label = "Height, metres"),
+    ht = structure(as.numeric(ht), label = "Height, metres"),
     country = structure("Italy", label = "Country"),
     setting = structure("Italy", label = "Setting"),
     site = structure(dagarm, label = "Site"),
@@ -304,7 +254,7 @@ patient_table <- patient |>
   arrange(first_visit_date)
 # Impute DOB for Italy (add 15th for day) and calculate age at index_date and at spirometry test
 
-# Age check
+# Age check - no longer necessary, age not provided in QISAR table now only DOB
 # agechk <- patient |>
 #   select(patient_id = uidpat, dob, age) |>
 #   right_join(patient_visits |>
@@ -328,6 +278,7 @@ patient_table <- patient |>
 
 # Lifestyle ----
 # Q - Need to know WHEN height, weight, BMI, smoking_status are recorded, asked AT 20261015
+# Looks like smoking only recorded once, at baseline presumably
 lifestyle <- patient_visits |>
   select(
     patient_id = uidpat,
@@ -344,10 +295,10 @@ lifestyle <- patient_visits |>
   # Keep earliest visit for smoke, wt, bmi - this aligns with UK
   slice_min(order_by = visit_date, by = patient_id, with_ties = T) |> 
   # get_dupes(patient_id) |> view()
-  # ITA_SITE22_42, ITS_SITE368_208, ITA_SITE368_97 have baseline and followup visits on the same day
-  filter_out(
-    patient_id %in% c("ITA_SITE22_42", "ITA_SITE368_208", "ITA_SITE368_97") & str_detect(visit_id, "followup")
-  ) |> 
+  # ITA_SITE22_42, ITS_SITE368_208, ITA_SITE368_97 have baseline and followup visits on the same day - fixed now
+  # filter_out(
+  #   patient_id %in% c("ITA_SITE22_42", "ITA_SITE368_208", "ITA_SITE368_97") & str_detect(visit_id, "followup")
+  # ) |> 
   left_join(
     patient_table |> 
       select(patient_id, 
@@ -360,7 +311,7 @@ lifestyle <- patient_visits |>
     height = structure(as.numeric(ht), label = "Baseline height, m"),
     bmi = structure(weight/ (height^2), label = "Baseline BMI, kg/m^2"),
     smoking_status = structure(
-      factor(smoke, levels = c("Current Smoker", "Ex-Smoker", "Never Smoked")),
+      factor(smoke, levels = c("Current smoker", "Ex-smoker", "Never smoked")),
       label = "Smoking status, baseline"
     )
   ) |>
@@ -373,44 +324,62 @@ lifestyle <- patient_visits |>
   )
 
 # Comorbidity ----
-# 20261015 STOPPED HERE!!!  Trying to align Italy and UK approaches but AT delays
 comorbidities <- patient_visits |>
   select(
     patient_id = uidpat,
     uidpatvis,
     allergic_rhinitis = allrhinitis,
-    chronic_rhinosinusitis = chrrhiniosinusitis,
+    crs = chrrhiniosinusitis,
     nasal_polyps = npolyp,
     eczema,
-    anxiety,
-    anxiety_stdate = anxiety_dte,
+    osteoporosis = osteop,
+    osteoporosis_stdate = osteop_dte,
+    t2diab,
+    t2diab_dte,
+    # hfailure,
+    # hfailure_stdate,
+    # mi,
+    # mi_stdate,
+    # stroke,
+    # stroke_stdate,
+    # embolism,
+    # csd = circulatory system disease?
     csd,
-    csd_type,
+    csd_type, #"1-5?"
     csd_type_oth,
-    csd_dte,
+    csd_stdate = csd_dte,
+    # glaucoma,
+    # glaucoma_stdate
+    # ocular contains glaucoma and cataracts?
     ocular,
     ocular_type,
     ocular_type_oth,
     ocular_dte,
-    obstructive_sleep_apnoea = obsleepapnoea_yn,
-    OSA_stdate = obsleepapnoea_stdt,
-    renal_failure = renalf,
-    renalf_stdate = renalf_dte,
-    depression = depress,
-    depression_stdate = depress_dte,
-    type2_diabetes = t2diab,
-    t2diab_stdate = t2diab_dte,
+    ocular_dte_imput,
+    depress,
+    depress_dte,
+    depress_dte_imput,
+    anxiety,
+    anxiety_dte,
+    anxiety_dte_imput,
+    osa = obsleepapnoea_yn,
+    osa_stdate = obsleepapnoea_stdt,
+    osa_stdate_imputed = obsleepapnoea_stdt_imput,
+    renalf,
+    renalf_dte,
     peptic_ulcer = peptic,
     peptic_ulcer_stdate = peptic_dte,
     pneumonia = pneum,
-    pneumonia_stdate = pneum_dte,
-    osteoporosis = osteop,
-    osteoporosis_stdate = osteop_dte,
+    pneumonia_dte = pneum_dte,
     gerd,
+    # gerd_stdate,
     egpa,
-    hypereosinophilic_syndrome = hyper,
-    uk_atopic_disease
-  ) |>
+    # egpa_stdate,
+    hypereos = hyper,
+    # hypereos_stdate
+    ) |>
+  rename_with(~str_replace(., "imput$", "imputed"), contains("imput")) |> 
+  rename_with(~str_replace(., "dte", "stdate"), contains("dte")) |> 
   select(
     where(\(x) any(!is.na(x))), # Keeps columns with any information
   ) |>
@@ -421,13 +390,24 @@ comorbidities <- patient_visits |>
   )
 
 # Allergens ----
-allergens <- patient_visits |>
-  select(patient_id = uidpat, uidpatvis, matches("sat|spt")) |>
+# Use Aaron's SRD approach for processing for now, though I'm not sure the QISAR structure makes senses
+# 20261111 AS/AT - sat_posallergen___0 and spt_posallergen___0 correspond to "No data" - all NA for Italy at least
+# Not sure if "No data" and "No positive allergen" make sense. 
+# Aaron's approach probably most sensible but unclear whether to use "positive" or 
+# "clinically relevant" - this variable was dropped from SRD and is only available for serum tests.
+allergens_cln <- allergens |> 
+  select(
+    everything(),
+    patient_id = uidpat,
+    -uiddb,
+    -dagarm
+  ) |> 
   # Do we want to check the "no positive allergen" for SPT for SAT and vice-versa, excluded here but in Aaron's SRD script
   mutate(
     # Revised Aaron's code to update and make consistent - need to work on "other"?
     sat_none = sat_posallergen___8 == "No Positive Allergens",
     spt_none = spt_posallergen___12 == "No Positive Allergens",
+    # Recode columns as Yes/No
     across(
       starts_with("sat_posallergen___"),
       \(x) {
@@ -440,8 +420,8 @@ allergens <- patient_visits |>
           !is.na(x) & x != "0" ~ "Yes",
           .default = x
         )
-      }
-      # .names = "{.col}_recode"
+      },
+      .names = "{.col}_yn"
     ),
     across(
       starts_with("spt_posallergen___"),
@@ -455,18 +435,73 @@ allergens <- patient_visits |>
           !is.na(x) & x != "0" ~ "Yes",
           .default = x
         )
-      }
-      # .names = "{.col}_recode"
+      },
+      .names = "{.col}_yn"
     )
   ) |>
   select(-contains("_none")) |>
-  rename_with(~ str_replace(., "_dte", "_date"), contains("dte")) |>
+
+  
+  rename(
+    # Using _pos instead of _yn as in SRD because this is the flag for a positive test
+    sat_pos_dust_result = sat_pos_dust,
+    sat_pos_dust = sat_pos_dust_yn,
+    sat_pos_grass_result = sat_pos_grass,
+    sat_pos_dust = sat_pos_grass_yn,
+    
+    
+    
+    sat_cat_pos = sat_posallergen___3,
+    sat_mould_pos = sat_posallergen___4,
+    sat_dog_pos = sat_posallergen___5,
+    sat_aspergillu_pos = sat_posallergen___6,
+    sat_other_pos = sat_posallergen___7,
+    sat_other_specify_1 = sat_pos_othspecify,
+    sat_other_result_1 = sat_pos_oth,
+    # sat_other_specify_2 = sat_pos_othspecify_2,
+    # sat_other_result_2 = sat_pos_oth_2,
+    # sat_other_specify_3 = sat_pos_othspecify_3,
+    # sat_other_result_3 = sat_pos_oth_3,
+    # sat_other_specify_4 = sat_pos_othspecify_4,
+    # sat_other_result_4 = sat_pos_oth_4
+    spt_dust_yn = spt_posallergen___7,
+    spt_grass_yn = spt_posallergen___1,
+    spt_cat_yn = spt_posallergen___9,
+    spt_mould_yn = spt_posallergen___5,
+    spt_dog_yn = spt_posallergen___10,
+    spt_aspergillus_yn = spt_posallergen___4,
+    spt_tree_yn = spt_posallergen___2,
+    
+  ) |> 
+  rename_with(~ str_replace(., "_dte", "_date"), contains("dte")) |> 
   left_join(
     visits |>
       select(uidpatvis, visit_id, visit_date),
     by = join_by(uidpatvis)
   ) |>
-  relocate(contains("visit_"), .after = patient_id)
+  relocate(contains("visit_"), .after = patient_id) |> 
+  # Add steps to create allergens variable used for analysis, modifying SRD - as in "glow_baseline.R"
+  mutate(
+    any_positive = if_any(matches("^(sat|spt)_.+_yn$"), ~ .x %in% "Yes"),
+    any_tested = if_any(matches("^(sat|spt)_.+_yn$"), ~ !is.na(.x)),
+    allergy = case_when(
+      any_positive ~ "Yes",
+      any_tested & !any_positive ~ "No",
+      .default = NA
+    )
+  )
+  # filter_out(is.na(allergy)) |>
+  # Ghislaine previously used if any positive allergen results then the patient is positive
+  summarise(
+    allergy = if_else(any(allergy == "Yes"), "Yes", "No"),
+    .by = patient_id
+  ) |>
+  mutate(
+    allergy = structure(
+      factor(allergy, levels = c("Yes", "No")),
+      label = "Any Positive Allergen Test"
+    )
+  )
 
 # HCRU ----
 hcru <- patient_visits |>
@@ -1356,3 +1391,31 @@ process_patient_v3 <- function(patient_data, month_gap_allowed = 3) {
     dropped_rows_missing_start_dates = dropped_rows_missing_start_dates
   )
 }
+
+
+# Dictionary ----
+variable_list <- ita_data |>
+  imap(\(table, tablename) {
+    vars <- names(table)
+    
+    vars |>
+      map(\(var) {
+        vals <- unique(table[[var]])
+        tibble(
+          qisar2_table = tablename,
+          qisar2_variable = var,
+          qisar2_values = paste(
+            if (length(vals) < 5) vals else vals[1:5],
+            collapse = ", "
+          )
+        )
+      }) |>
+      list_rbind()
+  }) |>
+  list_rbind() |>
+  mutate(
+    n = row_number(),
+    .by = qisar2_table
+  )
+# 
+# write_xlsx(variable_list, "qisar2_ita_data_dictionary.xlsx")
