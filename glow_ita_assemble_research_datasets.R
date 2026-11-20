@@ -2,30 +2,25 @@
 library(RODBC)
 library(tidyverse)
 library(janitor)
+library(ISARanalysis)
+library(kableExtra)
+library(rspiro)
 
 # Notes ----
-# 20261009 AT has been asked to revisit rebuild to ensure she pulls in 
-# all information and uses all transferred data so things may change. 
-# Worth finishing processing here, so we can make baseline and compare with G's
-# 20261015 Italy provides DOB as YYYY-MM-UNK -> Impute as 15th and calculate
-# 20261111 Neva has completed rebuild for QISAR2, will incorporate 
-
-# !!!!! - Exclude 419 patients with 2="No" for both inclusion criteria?
-# 20261111 NE - processing (based on what was done previously as well) just assumes step 4 
-# for those who are not on biologics or OCS. They may not have step 4 level 
-# medication or uncontrolled act/acq/gina or 2+ exacs recorded. They ask separate 
-# questions on their dictionary that specifically checks if a patient is on Gina 
-# step 4 and uncontrolled (you can refer to the excel in the email!). 
-# Means they should be technically included but then queried as to why their 
-# meds and/or asthma control don’t show the same.
 
 # To Do ----
-# Medications - probably better use supplement table
-# Exacerbations
-# Biologics
-# HCRU
-# Comorbidities
-# LTOCS - pending
+# Visits - done
+# Patient details - done
+# Lifestyle - done
+# Comorbidities - focus on T2 and OCS-related for now
+# Allergens - needs processing to get final variable
+# HCRU - check timeframes*
+# Exacerbations - very few dates, compare numbers against reported counts
+# Asthma control - done
+# Spirometry - done
+# Biomarkers - finish function
+# Medications - done
+# Biologics - done, queries sent to NE for site, exclude for now
 
 # Pull Italy data ----
 ## Connect to ISAR SQL tables
@@ -50,7 +45,7 @@ ita_data <- c(
   "ST_exits_reason",
   "data_dictionary",
   "data_dictionary_raw"
-  ) |>
+) |>
   set_names(nm = \(x) {
     str_remove(x, "_detail$") |>
       str_remove("^RR_") |>
@@ -58,7 +53,7 @@ ita_data <- c(
       str_remove("^ST_") |>
       str_remove("_predicted_values$") |>
       str_to_lower()
-    }) |>
+  }) |>
   map(\(table) {
     sqlQuery(
       connection,
@@ -102,21 +97,24 @@ load("qisar2_ita_data.RData")
 list2env(ita_data, envir = .GlobalEnv)
 
 # Visits ----
-visits <- patient |> 
+visits <- patient |>
   # n = 4138
   # Italy provides DOB so use this instead of age (not sure where this comes from), with day imputed as 15th
-  distinct(uidpat, dob) |>
   mutate(
     patient_id = structure(uidpat, label = "Patient ID"),
-    date_of_birth = structure(ymd(str_replace(dob, "UNK", "15")), label = "Date of birth, imputed as 15th")
-  ) |> 
-  # Right join because some patients in visits are missing from patient - fixed
+    date_of_birth = ymd(str_replace(dob, "UNK", "15")),
+    age_first_visit = as.numeric(NA)
+  ) |>
+  select(patient_id, age_first_visit, date_of_birth) |>
   left_join(
     patient_visits |>
-      distinct(patient_id = uidpat,
-               visit_date = dov,
-               uidpatvis),
-    by = join_by(patient_id)
+      distinct(
+        patient_id = uidpat,
+        visit_date = dov,
+        uidpatvis
+      ),
+    by = join_by(patient_id),
+    relationship = "one-to-many"
   ) |>
   mutate(
     visit_id = structure(
@@ -144,7 +142,12 @@ visits <- patient |>
     num_of_visits = n(),
     first_visit_date = min(visit_date, na.rm = T),
     last_visit_date = max(visit_date, na.rm = T),
-    age_at_visit = floor(interval(date_of_birth, visit_date) / years(1)),
+    age_at_visit = if_else(
+      is.na(date_of_birth),
+      age_first_visit +
+        floor(interval(first_visit_date, visit_date) / years(1)),
+      floor(interval(date_of_birth, visit_date) / years(1))
+    ),
     .by = patient_id
   ) |>
   mutate(
@@ -153,10 +156,10 @@ visits <- patient |>
     last_visit_date = structure(last_visit_date, label = "Last visit date"),
     age_at_visit = structure(age_at_visit, label = "Age at visit, years")
   ) |>
-  select(-dob, -uidpat) |>
-  arrange(patient_id, visit_date)
+  select(-age_first_visit, -date_of_birth) |>
+  arrange(patient_id, visit_date, visit_id)
 
-# Check visit ID versus date order - fixed 
+# Check visit ID versus date order
 visits_chks <- visits |>
   mutate(
     visit_order = case_when(
@@ -171,23 +174,16 @@ visits_chks <- visits |>
   arrange(patient_id, visit_date) |>
   mutate(date_order = row_number() - 1, .by = patient_id)
 
-# 69 patients with visits out of order - fixed
+# Find patients with visits out of order
 visits_chks |>
-  filter(visit_order != date_order) |>
+  filter(any(visit_order != date_order), .by = patient_id) |>
   distinct(patient_id) |>
-  pull(patient_id)
-# ITA_SITE13_13 baseline after followup
-# ITA_SITE156_2 no follow up 3, and 4 is six months after 2
-# ITA_SITE16_128 followup 1 out of order
-# ITA_SITE16_9 followup 8 and 9 out of order
-# ITA_SITE17_2 followup 6 and 7 out of order
-# ITA_SITE20_27 followup 6 and 7 out of order
-# ITA_SITE21_14 followup 8 and 9 out of order
-# ITA_SITE22_11 no visit 4
-# ITA_SITE22_24 followup 4 and 5 out of order
-# ITA_SITE22_39 followup 3 and 4 out of order
-# ITA_SITE23_16 no visit 7
-# 13 patients where baseline is not first visit
+  pull(patient_id) |>
+  noquote() |>
+  kable() |>
+  kable_styling()
+
+# Find patients where baseline is not first visit
 visits_chks |>
   filter(str_detect(visit_id, "baseline") & date_order != 0) |>
   distinct(patient_id) |>
@@ -195,52 +191,66 @@ visits_chks |>
   noquote() |>
   kable() |>
   kable_styling()
+rm(visits_chks)
 
 # Patient table ----
 # Patient-level, i.e. non-varying details, no separate Demographic table
-patient_table <- patient |> 
-  distinct(patient_id = uidpat, site = dagarm, .keep_all = TRUE) |>
+patient_table <- patient |>
   # Drop empty fields
   select(
-    patient_id,
-    site,
+    patient_id = uidpat,
     where(\(x) any(!is.na(x))),
     -contains("comstat"),
     -record_id
-  ) |> 
+  ) |>
   # Add first and last visit
   left_join(
-    visits |> 
-      distinct(patient_id,
-             first_visit_date,
-             last_visit_date,
-             num_of_visits,
-             date_of_birth),
+    visits |>
+      distinct(
+        patient_id,
+        first_visit_date,
+        last_visit_date,
+        num_of_visits
+      ),
     by = join_by(patient_id),
     relationship = "one-to-one"
   ) |>
   mutate(
+    date_of_birth = structure(
+      ymd(str_replace(dob, "UNK", "15")),
+      label = "Date of birth, imputed as 15th"
+    ),
     gender = structure(
       factor(gen, levels = c("Male", "Female")),
       label = "Gender"
     ),
     ethnicity = structure(eth, label = "Ethnicity"),
-    asthma_onset = structure(as.numeric(asmage), label = "Age at asthma onset, years"),
-    # Convert height to metres
-    ht = structure(as.numeric(ht), label = "Height, metres"),
+    asthma_onset = structure(
+      as.numeric(asmage),
+      label = "Age at asthma onset, years"
+    ),
+    asthma_onset_cat = structure(
+      case_when(
+        asthma_onset < 12 ~ "<12",
+        asthma_onset <= 40 ~ "12-40",
+        asthma_onset > 40 ~ ">40",
+        .default = NA
+      ) |>
+        factor(levels = c("<12", "12-40", ">40")),
+      label = "Age at asthma onset, years"
+    ),
     country = structure("Italy", label = "Country"),
     setting = structure("Italy", label = "Setting"),
     site = structure(dagarm, label = "Site"),
     data_capture_system = structure("Bespoke", label = "Data capture system"),
-    first_visit_date = structure(first_visit_date, label = "First visit date"),
-    last_visit_date = structure(last_visit_date, label = "Last visit date"),
-    num_of_visits = structure(num_of_visits, label = "Number of visits")
-  ) |> 
+    # Height recorded at each visit for Italy, ita_height_at_visit
+    # ht = structure(as.numeric(ht), label = "Height, metres"),
+  ) |>
   select(
     patient_id,
     country,
     setting,
-    site, # site is different to setting
+    site,
     first_visit_date,
     last_visit_date,
     num_of_visits,
@@ -249,82 +259,163 @@ patient_table <- patient |>
     date_of_birth,
     ethnicity,
     asthma_onset,
-    ht
-  ) |> 
+    asthma_onset_cat
+  ) |>
   arrange(first_visit_date)
-# Impute DOB for Italy (add 15th for day) and calculate age at index_date and at spirometry test
-
-# Age check - no longer necessary, age not provided in QISAR table now only DOB
-# agechk <- patient |>
-#   select(patient_id = uidpat, dob, age) |>
-#   right_join(patient_visits |>
-#                select(patient_id = uidpat, visit_id = uidpatvis, dov),
-#              by = join_by(patient_id)) |>
-#   mutate(
-#     year_of_birth = str_sub(dob, 1, 4),
-#     dov = ymd(dov),
-#     date_of_birth = ymd(str_replace(dob, "UNK", "15")),
-#     age_at_visit = floor(interval(date_of_birth, dov)/years(1))
-#   ) |>
-#   arrange(patient_id, dov) |> 
-#   filter(any(age != min(age_at_visit, na.rm = T)), .by = patient_id)
-# "Age" appears to be age at baseline visit
-# With this filter provided age is usually one year higher than calculated so we know DOB is that month AND prior to visit date
 
 # Notes:
-# Aaron's SRD approach appears complicated because of need to get additional 
+# AB's SRD approach appears complicated because of need to get additional
 # vars: index_date, max_beos_highest, highest_bec_imputed_flag, bt
 # Better I think to process biologics, BEC, bt separately and pull in later
 
 # Lifestyle ----
-# Q - Need to know WHEN height, weight, BMI, smoking_status are recorded, asked AT 20261015
+# Visit level information
+# VARS:
+# weight - Weight is recorded at each visit and is used as recorded.
+# height - Height is recorded at each visit and is used as recorded.
+# BMI - Recalculate
+# smoking_status - carried forward from the latest visit that recorded it, with logic rules
+
+clean_smoking <- function(df) {
+  # Check where duplicated visit dates
+  # Check: df |> count(smoke, smoking_status_cln)
+
+  # Fill NA with previous,
+  # Ex-smoker > Current = ok, keep current
+  # Ex-smoker > Never = ignore never, bring ex forward
+  # Ex-smoker > Ex-smoker = ok, keep ex-smoker
+  # Current > Current = ok
+  # Current > Ex_smoker = ok
+  # Current > Never = ignore never, bring current forward
+  # Never smoker > Current = ok
+  # Never smoker > Ex-smoker = never changes to ex-smoker, except never>current>ex, current left alone
+  # Never smoker > Never = ok
+
+  df |>
+    mutate(smoke = as.character(smoke)) |>
+    arrange(patient_id, visit_date) |>
+    mutate(
+      prior_smoked = dplyr::lag(
+        cumany(smoke %in% c("Ex-smoker", "Current smoker")),
+        default = FALSE
+      ),
+      # Blank out rows to be replaced (NA, or an impossible never)
+      smoking_status_cln = if_else(
+        smoke == "Never smoked" & prior_smoked,
+        NA_character_,
+        smoke
+      ),
+      .by = patient_id
+    ) |>
+    fill(smoking_status_cln, .direction = "down", .by = patient_id) |>
+    mutate(
+      # Find earliest ex/current record
+      first_smk = first(smoke[smoke %in% c("Ex-smoker", "Current smoker")]),
+      # If earliest ex/current record is "Ex-smoker" then replace "Never" with "Ex-smoker"
+      # Leaves all "Never" and any "Current" alone
+      smoking_status_cln = if_else(
+        smoking_status_cln == "Never smoked" & first_smk %in% "Ex-smoker",
+        "Ex-smoker",
+        smoking_status_cln
+      ),
+      .by = patient_id
+    ) |>
+    select(-prior_smoked, -first_smk)
+}
+clean_lifestyle <- function(df = lifestyle_labelled) {
+  df |>
+    mutate(
+      wt = as.numeric(wt),
+      ht = as.numeric(ht),
+      # Range checks
+      across(
+        c(wt),
+        \(var) {
+          var < 20 | var > 635
+        },
+        .names = "{.col}_rangefail"
+      ),
+      across(
+        c(ht),
+        \(var) {
+          var < 1.3 | var > 2.2
+        },
+        .names = "{.col}_rangefail"
+      ),
+      weight = structure(if_else(!wt_rangefail, wt, NA), label = "Weight, kg"),
+      height = structure(if_else(!ht_rangefail, ht, NA), label = "Height, m"),
+      bmi = structure(
+        case_when(
+          ht_rangefail | wt_rangefail ~ NA,
+          is.na(weight) | is.na(height) ~ NA,
+          .default = weight / (height^2)
+        ),
+        label = "BMI, kg/m^2"
+      ),
+      obese = structure(
+        case_when(
+          bmi < 30 ~ "No",
+          bmi >= 30 ~ "Yes",
+          .default = NA
+        ) |>
+          factor(levels = c("Yes", "No")),
+        label = "Obese (BMI ≥30 kg/m2)"
+      )
+    )
+}
+
 # Looks like smoking only recorded once, at baseline presumably
 lifestyle <- patient_visits |>
   select(
     patient_id = uidpat,
     uidpatvis,
     wt,
-    bmi,
-    smoke
-    ) |>
+    ht = ita_height_at_visit, # Italian height variable at visit
+    smoke # Varies by visit, a lot of Never smokers convert to Ex-smokers
+  ) |>
   left_join(
     visits |>
       select(uidpatvis, visit_id, visit_date),
     by = join_by(uidpatvis)
   ) |>
-  # Keep earliest visit for smoke, wt, bmi - this aligns with UK
-  slice_min(order_by = visit_date, by = patient_id, with_ties = T) |> 
-  # get_dupes(patient_id) |> view()
-  # ITA_SITE22_42, ITS_SITE368_208, ITA_SITE368_97 have baseline and followup visits on the same day - fixed now
-  # filter_out(
-  #   patient_id %in% c("ITA_SITE22_42", "ITA_SITE368_208", "ITA_SITE368_97") & str_detect(visit_id, "followup")
-  # ) |> 
-  left_join(
-    patient_table |> 
-      select(patient_id, 
-             ht) |> 
-      distinct(),
-    by = join_by(patient_id)
-    ) |> 
+  # Fill height (not weight) missings across visits, last measure forward and also back
+  fill(ht, .direction = "downup", .by = patient_id) |>
+  # Range check height and weight and calculate BMI, obesity
+  clean_lifestyle() |>
+  # Function cleans smoking status to plausible values over time
+  clean_smoking() |>
   mutate(
-    weight = structure(as.numeric(wt), label = "Baseline weight, kg"),
-    height = structure(as.numeric(ht), label = "Baseline height, m"),
-    bmi = structure(weight/ (height^2), label = "Baseline BMI, kg/m^2"),
     smoking_status = structure(
-      factor(smoke, levels = c("Current smoker", "Ex-smoker", "Never smoked")),
-      label = "Smoking status, baseline"
+      factor(
+        smoking_status_cln,
+        levels = c("Current smoker", "Ex-smoker", "Never smoked")
+      ),
+      label = "Smoking status"
     )
   ) |>
+  # count(smoke, smoking_status_cln)
   select(
     patient_id,
+    uidpatvis,
+    visit_id,
+    visit_date,
     weight,
     height,
     bmi,
+    obese,
     smoking_status
   )
 
+# Check smoking status
+# lifestyle |>
+#   filter(any(smoking_status!=smoking_status_cln),.by= patient_id) |>
+#   select(patient_id, uidpatvis, visit_date, contains("smoking_")) |>
+#   # filter(any(n_distinct(visit_date) < n()),.by= patient_id) |>
+#   view()
+
 # Comorbidity ----
-comorbidities <- patient_visits |>
+# Focus on T2 and OCS related conditions for now
+comorbidities_cln <- comorbidities |>
   select(
     patient_id = uidpat,
     uidpatvis,
@@ -334,8 +425,10 @@ comorbidities <- patient_visits |>
     eczema,
     osteoporosis = osteop,
     osteoporosis_stdate = osteop_dte,
+    osteop_dte_imput,
     t2diab,
     t2diab_dte,
+    t2diab_dte_imput,
     # hfailure,
     # hfailure_stdate,
     # mi,
@@ -348,6 +441,7 @@ comorbidities <- patient_visits |>
     csd_type, #"1-5?"
     csd_type_oth,
     csd_stdate = csd_dte,
+    csd_dte_imput,
     # glaucoma,
     # glaucoma_stdate
     # ocular contains glaucoma and cataracts?
@@ -367,41 +461,91 @@ comorbidities <- patient_visits |>
     osa_stdate_imputed = obsleepapnoea_stdt_imput,
     renalf,
     renalf_dte,
+    renalf_dte_imput,
     peptic_ulcer = peptic,
     peptic_ulcer_stdate = peptic_dte,
+    peptic_dte_imput,
     pneumonia = pneum,
     pneumonia_dte = pneum_dte,
+    pneumonia_stdate_imputed = pneum_dte_imput,
     gerd,
     # gerd_stdate,
+    copd,
     egpa,
     # egpa_stdate,
     hypereos = hyper,
     # hypereos_stdate
-    ) |>
-  rename_with(~str_replace(., "imput$", "imputed"), contains("imput")) |> 
-  rename_with(~str_replace(., "dte", "stdate"), contains("dte")) |> 
-  select(
-    where(\(x) any(!is.na(x))), # Keeps columns with any information
   ) |>
+  rename_with(~ str_replace(., "imput$", "imputed"), contains("imput")) |>
+  rename_with(~ str_replace(., "dte", "stdate"), contains("dte")) |>
+  # select(
+  #   where(\(x) any(!is.na(x))), # Keeps columns with any information
+  # ) |>
   left_join(
     visits |>
       select(uidpatvis, visit_id, visit_date),
     by = join_by(uidpatvis)
+  ) |>
+  relocate(visit_id, visit_date, .after = uidpatvis) |>
+  mutate(
+    # For allergic_rhinitis, crs, eczema Italy provides current, past, never, which we can code as "Ever", "Never" for SRD
+    across(c(allergic_rhinitis, crs, eczema), \(x) {
+      replace_values(x, "1" ~ "Current", "2" ~ "Past", "3" ~ "Never") |>
+        factor(levels = c("Current", "Past", "Never"))
+    }),
+    # For nasal polyps, csd, anxiety, depression, ocular, osa, renalfailure,
+    # t2diabetes, peptic ulcers, pneumonia, osteoporosis all Yes/No
+    # For SRD, yes/no mapped as current/never, directly but not sure if it's built longitudinally
+    hfailure = case_when(
+      csd == "Yes" & csd_type == "1" ~ "Ever",
+      csd == "Yes" ~ "Never",
+      csd == "No" ~ "Never",
+      .default = NA
+    ) |>
+      factor(levels = c("Ever", "Never")),
+    mi = case_when(
+      csd == "Yes" & csd_type == "2" ~ "Ever",
+      csd == "Yes" ~ "Never",
+      csd == "No" ~ "Never",
+      .default = NA
+    ) |>
+      factor(levels = c("Ever", "Never")),
+    stroke = case_when(
+      csd == "Yes" & csd_type == "3" ~ "Ever",
+      csd == "Yes" ~ "Never",
+      csd == "No" ~ "Never",
+      .default = NA
+    ) |>
+      factor(levels = c("Ever", "Never")),
+    embolism = case_when(
+      csd == "Yes" & csd_type == "4" ~ "Ever",
+      csd == "Yes" ~ "Never",
+      csd == "No" ~ "Never",
+      .default = NA
+    ) |>
+      factor(levels = c("Ever", "Never")),
+    csd_other = case_when(
+      csd == "Yes" & csd_type == "5" ~ "Ever",
+      csd == "Yes" ~ "Never",
+      csd == "No" ~ "Never",
+      .default = NA
+    ) |>
+      factor(levels = c("Ever", "Never"))
   )
 
 # Allergens ----
-# Use Aaron's SRD approach for processing for now, though I'm not sure the QISAR structure makes senses
+# Use AB's SRD approach for processing for now, though I'm not sure the QISAR structure makes senses
 # 20261111 AS/AT - sat_posallergen___0 and spt_posallergen___0 correspond to "No data" - all NA for Italy at least
-# Not sure if "No data" and "No positive allergen" make sense. 
-# Aaron's approach probably most sensible but unclear whether to use "positive" or 
+# Not sure if "No data" and "No positive allergen" make sense.
+# AB's approach probably most sensible but unclear whether to use "positive" or
 # "clinically relevant" - this variable was dropped from SRD and is only available for serum tests.
-allergens_cln <- allergens |> 
+allergens_cln <- allergens |>
   select(
     everything(),
     patient_id = uidpat,
     -uiddb,
     -dagarm
-  ) |> 
+  ) |>
   # Do we want to check the "no positive allergen" for SPT for SAT and vice-versa, excluded here but in Aaron's SRD script
   mutate(
     # Revised Aaron's code to update and make consistent - need to work on "other"?
@@ -441,16 +585,13 @@ allergens_cln <- allergens |>
   ) |>
   select(-contains("_none")) |>
 
-  
   rename(
     # Using _pos instead of _yn as in SRD because this is the flag for a positive test
     sat_pos_dust_result = sat_pos_dust,
     sat_pos_dust = sat_pos_dust_yn,
     sat_pos_grass_result = sat_pos_grass,
     sat_pos_dust = sat_pos_grass_yn,
-    
-    
-    
+
     sat_cat_pos = sat_posallergen___3,
     sat_mould_pos = sat_posallergen___4,
     sat_dog_pos = sat_posallergen___5,
@@ -471,15 +612,14 @@ allergens_cln <- allergens |>
     spt_dog_yn = spt_posallergen___10,
     spt_aspergillus_yn = spt_posallergen___4,
     spt_tree_yn = spt_posallergen___2,
-    
-  ) |> 
-  rename_with(~ str_replace(., "_dte", "_date"), contains("dte")) |> 
+  ) |>
+  rename_with(~ str_replace(., "_dte", "_date"), contains("dte")) |>
   left_join(
     visits |>
       select(uidpatvis, visit_id, visit_date),
     by = join_by(uidpatvis)
   ) |>
-  relocate(contains("visit_"), .after = patient_id) |> 
+  relocate(contains("visit_"), .after = patient_id) |>
   # Add steps to create allergens variable used for analysis, modifying SRD - as in "glow_baseline.R"
   mutate(
     any_positive = if_any(matches("^(sat|spt)_.+_yn$"), ~ .x %in% "Yes"),
@@ -490,12 +630,12 @@ allergens_cln <- allergens |>
       .default = NA
     )
   )
-  # filter_out(is.na(allergy)) |>
-  # Ghislaine previously used if any positive allergen results then the patient is positive
-  summarise(
-    allergy = if_else(any(allergy == "Yes"), "Yes", "No"),
-    .by = patient_id
-  ) |>
+# filter_out(is.na(allergy)) |>
+# GS previously used if any positive allergen results then the patient is positive
+summarise(
+  allergy = if_else(any(allergy == "Yes"), "Yes", "No"),
+  .by = patient_id
+) |>
   mutate(
     allergy = structure(
       factor(allergy, levels = c("Yes", "No")),
@@ -504,26 +644,27 @@ allergens_cln <- allergens |>
   )
 
 # HCRU ----
+# Need timeframes
 hcru <- patient_visits |>
   select(
     patient_id = uidpat,
     uidpatvis,
     exac_yn,
     exac_num,
+    exac_timeframe,
     emerg,
+    emerg_timeframe,
     hospadm,
-    invent
+    hospadm_timeframe,
+    invent,
+    invent_timeframe
   ) |>
-  # UK does not provide any exacerbation details
-  # left_join(
-  #   exacerbation_history |> distinct(uidpatvis, exac_dte),
-  #   by = "uidpatvis"
-  # ) |>
   left_join(
     visits |>
       select(uidpatvis, visit_id, visit_date),
     by = join_by(uidpatvis)
   ) |>
+  relocate(visit_id, visit_date, .after = uidpatvis) |>
   mutate(
     exac_num = structure(
       as.numeric(exac_num),
@@ -549,6 +690,7 @@ hcru <- patient_visits |>
   ) |>
   select(
     patient_id,
+    uidpatvis,
     visit_id,
     visit_date,
     exac_num,
@@ -565,511 +707,712 @@ hcru <- patient_visits |>
 # Use number for now
 
 # Asthma control ----
-# Based on Aaron's SRD "Asthma_control_table.R"
+clean_asthma_control <- function(df = asthma_control_labelled) {
+  gina_vars <- c(
+    "gina_day_1",
+    "gina_activity_2",
+    "gina_night_3",
+    "gina_reliever_4"
+  )
+  control_levels <- c("Uncontrolled", "Partly Controlled", "Well Controlled")
+  source_labels <- c(gina_ac = "GINA", act_ac = "ACT", acq_ac = "ACQ")
+
+  has_gina <- all(gina_vars %in% names(df))
+  has_act <- "act_score" %in% names(df)
+  has_acq <- "acq_score" %in% names(df)
+
+  if (!any(has_gina, has_act, has_acq)) {
+    warning(
+      "Asthma control variables not found (need all four GINA items, act_score, or acq_score). Returning data unchanged.",
+      call. = FALSE
+    )
+    return(df)
+  }
+  if (!"country" %in% names(df)) {
+    warning(
+      "Country variable not found. Returning data unchanged.",
+      call. = FALSE
+    )
+    return(df)
+  }
+
+  # GINA: requires all four items
+  if (has_gina) {
+    df <- df |>
+      mutate(
+        # Recode gina control questions as yes = 1 and no = 0
+        across(
+          all_of(gina_vars),
+          ~ case_when(
+            . == "Yes" ~ 1,
+            . == "1" ~ 1,
+            . == "No" ~ 0,
+            . == "2" ~ 0,
+            .default = NA
+          )
+        ),
+        # Calculate gina control score
+        gina_score = structure(
+          rowSums(pick(all_of(gina_vars)), na.rm = FALSE),
+          label = "GINA symptom control score"
+        ),
+        # Range check
+        gina_score_rangefail = gina_score < 0 | gina_score > 4,
+        # Classify gina control score
+        gina_ac = structure(
+          case_when(
+            gina_score_rangefail ~ NA,
+            gina_score == 0 ~ "Well Controlled",
+            gina_score <= 2 ~ "Partly Controlled",
+            gina_score <= 4 ~ "Uncontrolled"
+          ) |>
+            factor(levels = control_levels),
+          label = "Asthma control, GINA"
+        )
+      )
+  } else if (any(gina_vars %in% names(df))) {
+    message(
+      "GINA control not derived: missing ",
+      paste(setdiff(gina_vars, names(df)), collapse = ", ")
+    )
+  }
+
+  # ACT
+  if (has_act) {
+    df <- df |>
+      mutate(
+        act_score = structure(
+          as.numeric(act_score),
+          label = "ACT score"
+        ),
+        # Range check
+        act_score_rangefail = act_score < 5 | act_score > 25,
+        act_ac = structure(
+          case_when(
+            act_score_rangefail ~ NA,
+            act_score < 16 ~ "Uncontrolled",
+            act_score < 20 ~ "Partly Controlled",
+            act_score >= 20 ~ "Well Controlled",
+            .default = NA
+          ) |>
+            factor(levels = control_levels),
+          label = "Asthma control, ACT"
+        )
+      )
+  }
+
+  # ACQ (version of test used is unavailable)
+  if (has_acq) {
+    df <- df |>
+      mutate(
+        acq_score = structure(
+          as.numeric(acq_score),
+          label = "ACQ score"
+        ),
+        # Range check, exclude ACQ scores outside range, 0 - 6, ACQ is mean of 7 questions with 7-point scale (0 = no impairment; 6 = maximum impairment)
+        acq_score_rangefail = acq_score < 0 | acq_score > 6,
+        acq_ac = structure(
+          case_when(
+            acq_score_rangefail ~ NA,
+            acq_score <= 0.75 ~ "Well Controlled",
+            acq_score < 1.5 ~ "Partly Controlled",
+            acq_score >= 1.5 ~ "Uncontrolled",
+            .default = NA
+          ) |>
+            factor(levels = control_levels),
+          label = "Asthma control, ACQ"
+        ),
+        acq_version = structure(
+          case_when(
+            is.na(acq_score) ~ NA,
+            country == "UK" & str_detect(visit_id, "baseline") ~ "ACQ7",
+            country == "UK" & str_detect(visit_id, "followup") ~ "ACQ6",
+            country %in% c("Poland", "Mexico", "Brazil", "Italy") ~ "ACQ7",
+            country %in% c("Belgium", "Denmark") ~ "ACQ6",
+            !is.na(acq_score) ~ as.character("Unspecified ACQ")
+          ),
+          label = "ACQ version"
+        ),
+      )
+  }
+
+  # Combined control: gina_ac > act_ac > acq_ac (first non-missing, per row)
+  priority <- intersect(names(source_labels), names(df))
+
+  df <- df |>
+    mutate(
+      # reduce same as coalesce(coalesce(gina_ac, act_ac), acq_ac) but won't fail if column not present
+      asthma_control = structure(
+        reduce(pick(all_of(priority)), coalesce) |>
+          factor(levels = control_levels),
+        label = "Asthma control"
+      ),
+      # identify source of control measure selected
+      asthma_control_source = pick(all_of(priority)) |>
+        imap(\(x, nm) {
+          if_else(is.na(x), NA_character_, source_labels[[nm]])
+        }) |>
+        reduce(coalesce)
+    )
+  source_levels <- unname(source_labels[priority])
+
+  if (has_acq) {
+    df <- df |>
+      mutate(
+        asthma_control_source = if_else(
+          asthma_control_source == "ACQ",
+          acq_version,
+          asthma_control_source
+        )
+      )
+    source_levels <- c(
+      setdiff(source_levels, "ACQ"),
+      c("ACQ7", "ACQ6", "Unspecified ACQ")
+    )
+  }
+
+  df |>
+    mutate(
+      asthma_control_source = structure(
+        factor(asthma_control_source, levels = source_levels),
+        label = "Asthma control source"
+      )
+    ) |>
+    select(
+      patient_id,
+      uidpatvis,
+      visit_id,
+      visit_date,
+      any_of(
+        c(
+          "gina_day_1",
+          "gina_activity_2",
+          "gina_night_3",
+          "gina_reliever_4",
+          "gina_lf_5",
+          "gina_score",
+          "gina_score_rangefail",
+          "gina_ac",
+          "act_score",
+          "act_score_rangefail",
+          "act_ac",
+          "acq_score",
+          "acq_score_rangefail",
+          "acq_version",
+          "acq_ac",
+          "airq_score",
+          "asthma_control",
+          "asthma_control_source"
+        )
+      ),
+      everything(),
+      -country
+    )
+}
 # Italy doesn't include GINA question 1 on activity, based on ACT > ACQ
-asthma_control <- total_patients |>
+asthma_control_cln <- patient_table |>
+  select(patient_id, country) |>
   left_join(
-    patient_visits |>
+    asthma_control |>
       select(
         patient_id = uidpat,
-        visit_id = uidpatvis,
-        visit_date = dov,
-        asthma_control,
-        acq_score,
-        act_score,
-        gina_day_1,
-        gina_activity_2 = gina_activity,
-        gina_night_3,
-        gina_reliever_4,
-        gina_lf_5
+        uidpatvis,
+        contains("gina"),
+        any_of(
+          c(
+            "act_score",
+            "acq_score",
+            "airq_score"
+          )
+        ),
+        contains("asthma_control")
       ),
+    by = join_by(patient_id),
+    relationship = "one-to-many"
+  ) |>
+  left_join(
+    visits |>
+      select(uidpatvis, visit_id, visit_date),
+    by = join_by(uidpatvis)
+  ) |>
+  relocate(visit_id, visit_date, .after = country) |>
+  clean_asthma_control()
+
+# Spirometry ----
+# Modification of clean_spirometry function from ISARanalysis
+clean_spirometry <- function(
+  df = spirometry_labelled,
+  fev1_range_low = 0.15,
+  fev1_range_high = 8,
+  fvc_range_low = 0.15,
+  fvc_range_high = 8
+) {
+  df |>
+    rename_with(
+      ~ str_remove(.x, "observation_|visit_|spirometry_"),
+      .cols = contains("_date")
+    ) |>
+    # Drop rows with missing measurement date is missing
+    filter_out(is.na(date)) |>
+    # If post-bronchodilator measures are not available at all time points for a patient, use pre-bronchodilator only to be consistent over time
+    mutate(
+      exclude_post_fev1_measures = !all(!is.na(post_fev1)),
+      exclude_post_fvc_measures = !all(!is.na(post_fvc)),
+      .by = patient_id
+    ) |>
+    # Range checks against values specified above
+    mutate(
+      across(c(pre_fev1, post_fev1, pre_fvc, post_fvc), \(var) as.numeric(var)),
+      across(
+        c(pre_fev1, post_fev1),
+        \(var) {
+          !is.na(var) &
+            (var < fev1_range_low | var > fev1_range_high)
+        },
+        .names = "{.col}_rangefail"
+      ),
+      across(
+        c(pre_fvc, post_fvc),
+        \(var) {
+          !is.na(var) &
+            (var < fvc_range_low | var > fvc_range_high)
+        },
+        .names = "{.col}_rangefail"
+      ),
+      # FEV1 should be less than FVC, but could be the same
+      pre_fev1_fvc_implausible = !is.na(pre_fev1) &
+        !is.na(pre_fvc) &
+        pre_fev1 > pre_fvc,
+      post_fev1_fvc_implausible = !is.na(post_fev1) &
+        !is.na(post_fvc) &
+        post_fev1 > post_fvc,
+      # Flag records to exclude based on above checks
+      pre_fev1_exclude = pre_fev1_rangefail | pre_fev1_fvc_implausible,
+      pre_fvc_exclude = pre_fvc_rangefail | pre_fev1_fvc_implausible,
+      post_fev1_exclude = post_fev1_rangefail |
+        post_fev1_fvc_implausible |
+        exclude_post_fev1_measures,
+      post_fvc_exclude = post_fvc_rangefail |
+        post_fev1_fvc_implausible |
+        exclude_post_fvc_measures
+    ) |>
+    mutate(
+      # Create single fev1 measure for baseline and longitudinal description
+      fev1 = structure(
+        case_when(
+          pre_fev1_exclude & post_fev1_exclude ~ NA,
+          !is.na(post_fev1) & !post_fev1_exclude ~ post_fev1,
+          !is.na(post_fev1) & post_fev1_exclude & !pre_fev1_exclude ~ pre_fev1,
+          !is.na(pre_fev1) & !pre_fev1_exclude ~ pre_fev1,
+          .default = NA
+        ) |>
+          as.numeric(),
+        label = "FEV1 (L)"
+      ),
+      # Flag value used for overall measure
+      fev1_flag = case_when(
+        pre_fev1_exclude & post_fev1_exclude ~ "none",
+        !is.na(post_fev1) & !post_fev1_exclude ~ "post",
+        !is.na(post_fev1) & post_fev1_exclude & !pre_fev1_exclude ~ "pre",
+        !is.na(pre_fev1) & !pre_fev1_exclude ~ "pre",
+        .default = NA_character_ # Empty if no FEV1 measure
+      ),
+      # Create single fvc measure for baseline and longitudinal description
+      fvc = structure(
+        case_when(
+          pre_fvc_exclude & post_fvc_exclude ~ NA,
+          !is.na(post_fvc) & !post_fvc_exclude ~ post_fvc,
+          !is.na(post_fvc) & post_fvc_exclude & !pre_fvc_exclude ~ pre_fvc,
+          !is.na(pre_fvc) & !pre_fvc_exclude ~ pre_fvc,
+          .default = NA
+        ) |>
+          as.numeric(),
+        label = "FVC (L)"
+      ),
+      fvc_flag = case_when(
+        pre_fvc_exclude & post_fvc_exclude ~ "none",
+        !is.na(post_fvc) & !post_fvc_exclude ~ "post",
+        !is.na(post_fvc) & post_fvc_exclude & !pre_fvc_exclude ~ "pre",
+        !is.na(pre_fvc) & !pre_fvc_exclude ~ "pre",
+        .default = NA_character_ # Empty if no FVC measure
+      ),
+      # Calculate ratio measure for baseline and longitudinal description
+      fev1_fvc_ratio = structure(
+        fev1 / fvc,
+        label = "FEV1/FVC ratio"
+      ),
+      # Create categorical ratio measure for baseline and longitudinal description
+      fev1_fvc_ratio_cat = structure(
+        case_when(
+          fev1_fvc_ratio < 0.70 ~ "<0.70",
+          fev1_fvc_ratio >= 0.70 ~ "≥0.70",
+          .default = NA
+        ) |>
+          factor(levels = c("<0.70", "≥0.70")),
+        label = "FEV1/FVC ratio"
+      )
+    )
+}
+
+spirometry_cln <- spirometry |>
+  mutate(
+    p = str_match(uidpat, "^([^_]+)_([^_]+)_(\\d+)$"),
+    patient_id = str_c(
+      p[, 2],
+      p[, 3],
+      "_",
+      str_pad(p[, 4], width = 5, pad = "0")
+    ),
+    q = str_match(uidpatvis, "^([^_]+)_([^_]+)_(\\d+)_(.*)$"),
+    uidpatvis = str_c(
+      q[, 2],
+      q[, 3],
+      "_",
+      str_pad(q[, 4], width = 5, pad = "0"),
+      "_",
+      q[, 5]
+    )
+  ) |>
+  select(-p, -q, -uidpat) |>
+  left_join(
+    visits |>
+      select(uidpatvis, visit_id, visit_date, age_at_visit),
+    by = join_by(uidpatvis)
+  ) |>
+  left_join(
+    patient_table |>
+      select(patient_id, gender),
     by = join_by(patient_id)
   ) |>
-  mutate(
-    visit_id = case_when(
-      str_detect(visit_id, "barm") ~ as.character(paste0(
-        patient_id,
-        "_baseline"
-      )),
-      str_detect(visit_id, "historic") ~ as.character(paste0(
-        patient_id,
-        "_historic"
-      )),
-      str_detect(visit_id, "f\\d{1,2}arm1") ~ as.character(paste0(
-        patient_id,
-        "_followup",
-        sub(".*f(\\d{1,2})arm1.*", "\\1", visit_id)
-      )),
-      str_detect(visit_id, "adeseguimiearm") ~ str_replace(
-        visit_id,
-        "_adeseguimiearm1([a-z]?)$",
-        ~ {
-          letter <- str_remove(.x, "_adeseguimiearm1")
-          idx <- if_else(letter == "", 1L, match(letter, letters))
-          paste0("_followup", idx)
-        }
-      )
-    ),
-    # Visit dates all plausible and no missing
-    visit_date = ymd(visit_date),
-    across(contains("score"), as.numeric),
-    acq_version = case_when(
-      !is.na(acq_score) &
-        str_detect(patient_id, "POL|MEX|BRZ|GBR|ITA") ~ as.character("ACQ7"),
-      !is.na(acq_score) & str_detect(patient_id, "BEL|DEN") ~ as.character(
-        "ACQ6"
-      ),
-      !is.na(acq_score) ~ as.character("Unspecified ACQ")
-    )
+  left_join(
+    lifestyle |>
+      select(uidpatvis, height),
+    by = join_by(uidpatvis)
   ) |>
-  # Exclude ACT scores outside range, 5 <= ACT <= 25
-  filter_out(act_score > 25 | act_score < 5) |>
-  # Exclude ACQ scores outside range, 0 - 6, ACQ is mean of 7 questions with 7-point scale (0 = no impairment; 6 = maximum impairment)
-  filter_out(acq_score > 6 | acq_score < 0) |>
-  mutate(
-    # Classify ACQ score (version of test used is unavailable)
-    acq_ac = case_when(
-      acq_score <= 0.75 ~ "Well Controlled",
-      acq_score < 1.5 ~ "Partly Controlled",
-      acq_score >= 1.5 ~ "Uncontrolled",
-      .default = NA
-    ) |>
-      factor(
-        levels = c("Uncontrolled", "Partly Controlled", "Well Controlled")
-      ),
-    # Classify ACT score
-    act_ac = case_when(
-      act_score < 16 ~ "Uncontrolled",
-      act_score < 20 ~ "Partly Controlled",
-      act_score >= 20 ~ "Well Controlled",
-      .default = NA
-    ) |>
-      factor(
-        levels = c("Uncontrolled", "Partly Controlled", "Well Controlled")
-      ),
-    # Results are usually prioritised GINA > ACT > ACQ > AIRQ.
-    # Italy has missing responses for GINA questions 1 and 4, so prioritise ACT.
-    asthma_control = case_when(
-      !is.na(act_ac) ~ act_ac,
-      !is.na(acq_ac) ~ acq_ac,
-      .default = NA
-    )
-  ) |>
-  filter_out(is.na(asthma_control)) |>
   select(
     patient_id,
     visit_id,
+    uidpatvis,
     visit_date,
-    asthma_control,
-    act_score,
-    act_ac,
-    acq_score,
-    acq_version,
-    acq_ac
+    gender,
+    age_lf = age_at_visit,
+    ht_lf = height,
+    sp_date,
+    sp_date_imput,
+    pre_fev1 = bdfev1_pre,
+    pre_fvc = bdfvc_pre,
+    post_fev1 = bdfev1_post,
+    post_fvc = bdfvc_post
   ) |>
-  # Remove duplicates
-  distinct()
-
-
-group_by(patient_id, visit_id) |>
-  tidyr::fill(everything(), .direction = "updown") |>
-  distinct |>
-  ungroup |>
+  arrange(patient_id, visit_date) |>
+  clean_spirometry() |>
+  # Add derived spirometry measures using Rspiro package
   mutate(
-    visit_date_imputed_flag = case_when(
-      visit_date < as.Date("2000-01-01") ~ as.character(
-        "Visit date nulled as it was prior to 2000-01-01, likely a birth date"
-      ),
-      visit_date > Sys.Date() ~ as.character(
-        "Visit date nulled as it was in the future"
-      ),
-      T ~ NA
+    fev1_GLIgl_lln = rspiro::LLN_GLIgl(age_lf, ht_lf, gender, param = "fev1"),
+    fev1_GLIgl_pctpred = rspiro::pctpred_GLIgl(
+      age_lf,
+      ht_lf,
+      gender,
+      FEV1 = fev1
     ),
-    visit_date = ifelse(
-      visit_date < as.Date("2000-01-01") | visit_date > Sys.Date(),
-      NA,
-      as.character(visit_date)
+    fev1_GLIgl_zscore = rspiro::zscore_GLIgl(
+      age_lf,
+      ht_lf,
+      gender,
+      FEV1 = fev1
     ),
-    visit_date_imputed = ifelse(!is.na(visit_date_imputed_flag), 1, 0),
-
-    acq_version = case_when(
-      !is.na(acq_score) &
-        grepl("POL|MEX|BRZ|GBR|ITA", patient_id) ~ as.character("ACQ7"),
-      !is.na(acq_score) & grepl("BEL|DEN", patient_id) ~ as.character("ACQ6"),
-      !is.na(acq_score) ~ as.character("Unspecified ACQ")
+    fvc_GLIgl_lln = rspiro::LLN_GLIgl(age_lf, ht_lf, gender, param = "fvc"),
+    fvc_GLIgl_pctpred = rspiro::pctpred_GLIgl(age_lf, ht_lf, gender, FVC = fvc),
+    fvc_GLIgl_zscore = rspiro::zscore_GLIgl(age_lf, ht_lf, gender, FVC = fvc),
+    fev1_GLIgl_pctpred_cat = structure(
+      case_when(
+        fev1_GLIgl_pctpred < 80 ~ "<80%",
+        fev1_GLIgl_pctpred >= 80 ~ "≥80%",
+        .default = NA
+      ) |>
+        factor(levels = c("<80%", "≥80%")),
+      label = "percent predicted FEV1 (%)"
     ),
-  )
-select(
-  patient_id,
-  visit_id,
-  visit_id_imputed,
-  visit_id_imputed_flag,
-  visit_date,
-  visit_date_imputed,
-  visit_date_imputed_flag,
-  asthma_control,
-  asthma_control_imputed,
-  asthma_control_imputed_flag,
-  acq_score,
-  acq_score_imputed,
-  acq_score_imputed_flag,
-  acq_version,
-  acq_version_imputed,
-  acq_version_imputed_flag,
-  act_score,
-  act_score_imputed,
-  act_score_imputed_flag,
-  gina_day_1,
-  gina_day_1_imputed,
-  gina_day_1_imputed_flag,
-  gina_activity_2,
-  gina_activity_2_imputed,
-  gina_activity_2_imputed_flag,
-  gina_night_3,
-  gina_night_3_imputed,
-  gina_night_3_imputed_flag,
-  gina_reliever_4,
-  gina_reliever_4_imputed,
-  gina_reliever_4_imputed_flag,
-  gina_lf_5,
-  gina_lf_5_imputed,
-  gina_lf_5_imputed_flag
-) |>
-  distinct |>
-  mutate(
-    visit_id = case_when(
-      grepl("barm", visit_id) ~ as.character(paste0(patient_id, "_baseline")),
-      grepl("historic", visit_id) ~ as.character(paste0(
-        patient_id,
-        "_historic"
-      )),
-      grepl("f\\d{1,2}arm1", visit_id) ~ as.character(paste0(
-        patient_id,
-        "_followup",
-        sub(".*f(\\d{1,2})arm1.*", "\\1", visit_id)
-      )),
-      grepl("adeseguimiearm", visit_id) ~ str_replace(
-        visit_id,
-        "_adeseguimiearm1([a-z]?)$",
-        ~ {
-          letter <- str_remove(.x, "_adeseguimiearm1")
-          idx <- if_else(letter == "", 1L, match(letter, letters))
-          paste0("_followup", idx)
-        }
-      )
-    ),
-    visit_date = as.Date(visit_date),
-    acq_score = as.numeric(acq_score),
-    act_score = as.numeric(act_score),
-    gina_day_1 = as.numeric(gina_day_1),
-    gina_activity_2 = as.numeric(gina_activity_2),
-    gina_night_3 = as.numeric(gina_night_3),
-    gina_reliever_4 = as.numeric(gina_reliever_4),
-    gina_lf_5 = as.numeric(gina_lf_5),
-    asthma_control = case_when(
-      asthma_control == "Partially Controlled" ~ as.character(
-        "Partly Controlled"
-      ),
-      T ~ as.character(asthma_control)
-    )
-  ) |>
-  inner_join(Visit |> distinct(visit_id), by = "visit_id") |>
-  mutate(
-    across(
-      matches("gina_"),
-      ~ case_when(
-        . == "0" ~ NA,
-        . == "1" ~ "Yes",
-        . == "2" ~ "No"
-      )
+    fev1_GLIgl_zscore_cat = structure(
+      case_when(
+        fev1_GLIgl_zscore < -1.64 ~ "< -1.64",
+        fev1_GLIgl_zscore >= -1.64 ~ "≥ -1.64",
+        .default = NA
+      ) |>
+        factor(levels = c("< -1.64", "≥ -1.64")),
+      label = "FEV1 Z-score"
     )
   )
 
-# Spirometry ----
+# Still a few with FVC < FEV1
+spirometry_cln |>
+  filter(if_any(contains("implausible")) | if_any(contains("rangefail"))) |>
+  pull(patient_id) |>
+  noquote()
 
 # Biomarkers ----
-# Based on Aaron's SRD "Biomarker_table.R"
+# Question - impute missing dates with visit date, then check for duplicates?
 # Italy doesn't provide IgE dates
-biomarkers <- total_patients |>
-  left_join(
-    blood_and_sputum_eosinophils |>
-      select(
-        patient_id = uidpat,
-        visit_id = uidpatvis,
-        where(\(x) any(!is.na(x))),
-        -uiddb,
-        -record_id,
-        -dagarm,
-        -contains("redcap"),
-        -beos_yn,
-        beos_result = beos_cnt,
-        beos_date = beos_dte,
-        ige_result = ige_cnt,
-        feno_result = feno_rlt
+
+clean_biomarkers <- function(
+  df = biomarkers_labelled,
+  beos_range_low = 0,
+  beos_range_high = 5000,
+  feno_range_low = 0,
+  feno_range_high = 300,
+  ige_range_low = 0,
+  ige_range_high = 100000,
+  reduce_function = "max",
+  drop_duplicate = TRUE,
+  drop_rangefail = FALSE
+) {
+  if (!reduce_function %in% c("min", "max", "mean")) {
+    stop('De-duplicating function must be "min", "mean", or "max"')
+  }
+
+  df <- df |>
+    # remove_empty_imputation_fields() |>
+    # rename_with(~ str_replace(.x, "_rlt", "_cnt"), contains("feno")) |>
+    # pivot_longer(
+    #   cols = -c(
+    #     patient_id,
+    #     visit_id,
+    #     visit_id_imputed,
+    #     visit_id_imputed_flag,
+    #     result_date,
+    #     result_date_imputed,
+    #     result_date_imputed_flag
+    #   ),
+    #   names_to = c("test", ".value"),
+    #   names_pattern = "^(.+?)_(cnt|cnt_imputed_flag|cnt_imputed)$"
+    # ) |>
+    # filter_out(is.na(cnt)) |>
+    # rename_with(~ str_replace(.x, "cnt", "result"), contains("cnt")) |>
+    # mutate(result_date = ymd(result_date)) |>
+    # Range checks against values specified above
+    mutate(
+      exclude_rangefail = case_when(
+        test == "beos" &
+          (result < beos_range_low | result > beos_range_high) ~ TRUE,
+        test == "feno" &
+          (result < feno_range_low | result > feno_range_high) ~ TRUE,
+        test == "ige" &
+          (result < ige_range_low | result > ige_range_high) ~ TRUE,
+        .default = FALSE
       ),
-    by = join_by(patient_id)
+    ) |>
+    mutate(
+      duplicate_result = case_when(
+        n() > 1 ~ TRUE,
+        .default = FALSE
+      ),
+      keep_result = case_when(
+        duplicate_result &
+          reduce_function == "min" &
+          result != min(result, na.rm = TRUE) ~ FALSE,
+        duplicate_result &
+          reduce_function == "mean" &
+          result != mean(result, na.rm = TRUE) ~ FALSE,
+        duplicate_result &
+          reduce_function == "max" &
+          result != max(result, na.rm = TRUE) ~ FALSE,
+        .default = TRUE
+      ),
+      .by = c(patient_id, date, test)
+    )
+
+  if (drop_duplicate) {
+    df <- df |>
+      filter(keep_result) |>
+      # Some patients still have identical rows - these can be dropped, keeps first
+      distinct(patient_id, date, test, .keep_all = TRUE) |>
+      select(-keep_result, -duplicate_result)
+  }
+
+  if (drop_rangefail) {
+    df <- df |>
+      filter_out(exclude_rangefail) |>
+      select(-exclude_rangefail)
+  }
+}
+
+biomarkers_cln <- biomarkers |>
+  select(
+    patient_id = uidpat,
+    everything(),
+    -uiddb,
+    -dagarm,
+    -contains("_yn"),
+    -contains("ita_"),
+    -contains("_imput"),
+    -contains("_timeframe"),
+    -import_log_id
   ) |>
+  rename_with(~ str_replace(., "_cnt", "_result"), everything()) |>
+  rename_with(~ str_replace(., "_dte", "_date"), everything()) |>
   mutate(
-    ige_date = NA
+    feno_unit = "ppb"
+  ) |>
+  left_join(
+    visits |>
+      select(uidpatvis, visit_id, visit_date),
+    by = join_by(uidpatvis)
   ) |>
   pivot_longer(
-    cols = !all_of(c("patient_id", "visit_id")),
+    cols = !all_of(c("patient_id", "uidpatvis", "visit_id", "visit_date")),
     names_to = c("test", ".value"),
     names_sep = "_"
   ) |>
-  filter_out(is.na(result), is.na(date)) |>
+  filter_out(is.na(result)) |>
   mutate(
-    result = as.numeric(result),
-    date = ymd(date),
-    result = 
-      case_when(
-        # Truncate IgE and FeNO counts (same as NJH)
-        test == "ige" & result <= 2 ~ 2,
-        test == "ige" & result >= 5000 ~ 5000,
-        test == "feno" & result <= 5 ~ 5,
-        test == "feno" & result <= 300 ~ 300,
-        test == "beos"
-        .default = result
-      ),
-    unit = 
-      case_when(
-        test == "ige" ~ 
-      )
-  ) |> 
-  
-  
-# left_join(visits |> select(visit_id, visit_date), by = join_by(visit_id)) |>
-# relocate(visit_date, .after = visit_id)
-
-# Need range checks on IGE and FeNO and units for BEC
-# Some values recorded as >5000 or <2, truncate all the same way
-result = case_when(
-  ige_value <= 2 ~ 2,
-  ige_value >= 5000 ~ 5000,
-  .default = round(ige_value, 0)
-)
-# Some values recorded as >300 or <5, truncate all the same way
-result = case_when(
-  feno_value <= 5 ~ 5,
-  feno_value >= 300 ~ 300,
-  .default = round(feno_value, 0)
-)
-# Exclude ACT scores outside range, 5 <= ACT <= 25
-filter_out(act_score > 25 | act_score < 5) |>
-  # Exclude ACQ scores outside range, 0 - 6, ACQ is mean of 7 questions with 7-point scale (0 = no impairment; 6 = maximum impairment)
-  filter_out(acq_score > 6 | acq_score < 0) |>
-  # Some values recorded as >300 or <5, truncate all the same way
-  result = case_when(
-    feno_value <= 5 ~ 5,
-    feno_value >= 300 ~ 300,
-    .default = round(feno_value, 0)
+    date = if_else(!is.na(date), dmy(date), visit_date), # Almost all test dates, where available for FeNO, are same as visit date, except ~20 earlier ones
+    result = as.numeric(result)
   )
-result = case_when(
-  ige_value <= 2 ~ 2,
-  ige_value >= 5000 ~ 5000,
-  .default = round(ige_value, 0)
-)
-result = case_when(
-  # Convert to cells/uL (multiply K/uL or 10*9/L by 1000)
-  unit == "K/uL" ~ eos_value * 1000,
-  unit == "10*9/L" ~ eos_value * 1000,
-  unit == "Unknown" ~ eos_value * 1000, # 6 unknown values, all other tests for these patients in K/uL and results look similar
-  .default = eos_value
-),
-orig_unit = unit,
-unit = "cells/uL"
-) |>
-
 
 # Medications ----
-# GS - therapy data provided by Italy is not linked to visits. The file lists 
-# start dates (and potentially en dates if treatment has been discontinued) for 
-# all asthma-related drugs. It should be a lot easier to use this data without 
-# taking visits into consideration. We need to be careful not assuming « No » 
-# when the drug is not listed: eg, for LTOCS, I am assuming missing when only 
-# bx is listed there (it’s not plausible that a patient would initiate bx with 
+# GS - therapy data provided by Italy is not linked to visits. The file lists
+# start dates (and potentially en dates if treatment has been discontinued) for
+# all asthma-related drugs. It should be a lot easier to use this data without
+# taking visits into consideration. We need to be careful not assuming « No »
+# when the drug is not listed: eg, for LTOCS, I am assuming missing when only
+# bx is listed there (it’s not plausible that a patient would initiate bx with
 # no other asthma-related drug). I am also looking at the time window covered by
 # the data, ie data can be entered in the CRF but the therapy data not entered.
 
-# Table with pre-processed medications - this will be a supplement table
-# SELECT * FROM QISAR2.ita.example_medications
-
-# Based on Aaron's SRD "Medication_table.R"
-medications <- asthma_medications |>
-  # Keep non-empty columns
+# Use supplement table for querying and creating biologic table below
+medications_cln <- medications |>
   select(
-    patient_id = uidpat,
-    visit_id = uidpatvis,
-    where(\(x) any(!is.na(x))),
-    -uiddb,
-    -record_id,
-    -dagarm,
-    -contains("redcap"),
-    # All "other" tezepelumab recorded under antiil5
-    -antiil5_oth
-  ) |>
-  # Bare drug columns (no underscore) -> "<drug>_name"
-  rename_with(
-    ~ paste0(.x, "_name"),
-    .cols = !all_of(c("patient_id", "visit_id")) & !contains("_")
+    -episode_id,
+    -medication_class, # Eventually same as derived as "therapy" below but latter more specific
+    -contains("imput"),
+    -contains("import"),
+    start_date = therapy_start,
+    end_date = therapy_end,
   ) |>
   mutate(
-    # Recode "1" to "Yes"
-    across(c(lama_yn, ltra_yn, theo_yn, mabx_yn), \(x) {
-      replace_values(x, "1" ~ "Yes")
-    }),
-    visit_id = case_when(
-      str_detect(visit_id, "barm") ~ as.character(paste0(
-        patient_id,
-        "_baseline"
-      )),
-      str_detect(visit_id, "historic") ~ as.character(paste0(
-        patient_id,
-        "_historic"
-      )),
-      str_detect(visit_id, "f\\d{1,2}arm1") ~ as.character(paste0(
-        patient_id,
-        "_followup",
-        sub(".*f(\\d{1,2})arm1.*", "\\1", visit_id)
-      )),
-      str_detect(visit_id, "adeseguimiearm") ~ str_replace(
-        visit_id,
-        "_adeseguimiearm1([a-z]?)$",
-        ~ {
-          letter <- str_remove(.x, "_adeseguimiearm1")
-          idx <- if_else(letter == "", 1L, match(letter, letters))
-          paste0("_followup", idx)
-        }
-      )
-    ),
-    # Recode "other" macrolides: Ciprofloxacin; Levofloxacin
-    mabx_name = case_when(
-      mabx_name == "Other" & !is.na(mabx_oth) ~ mabx_oth,
-      .default = mabx_name
-    ),
-    # Recode "other" LABA: Terbutaline
-    laba_name = case_when(
-      laba_name == "Other" & !is.na(laba_oth) ~ laba_oth,
-      .default = laba_name
+    # One UNK day in date to impute as 15th
+    start_date = case_when(
+      str_detect(start_date, "^UNK-") ~ str_replace(start_date, "^UNK-", "15-"),
+      .default = start_date
     )
   ) |>
-  select(-contains("_oth")) |>
+  # Bare therapy columns (no underscore) -> "<therapy>_name"
+  rename_with(
+    ~ str_remove_all(., "_") |>
+      str_replace("labeldose", "_labeldose") |>
+      str_replace("freq", "_freq"),
+    matches("mos|ics|anti|rhin|bron")
+  ) |>
+  rename_with(
+    ~ paste0(.x, "_name"),
+    .cols = !all_of(c("patient_id", "start_date", "end_date")) &
+      !matches("dose|freq|biologic")
+  ) |>
   pivot_longer(
-    cols = !all_of(c("patient_id", "visit_id")),
-    names_to = c("drug", ".value"),
+    cols = !all_of(c(
+      "patient_id",
+      "start_date",
+      "end_date",
+      "biologic_switch_reason",
+      "biologic_switch_adverse_event_grade"
+    )),
+    names_to = c("therapy", ".value"),
     names_sep = "_"
   ) |>
-  # All missing where yn == NA & yn == "No"
-  filter(yn == "Yes") |>
-  # Range checks
+  filter(!is.na(name)) |>
   mutate(
-    drug = case_when(
-      drug %in% c("antiige", "antiil4", "antiil5") ~ "Biologic",
-      drug == "mos" ~ "LTOCS",
-      drug == "ics" ~ "ICS only",
-      drug == "mabx" ~ "Macrolides",
-      .default = str_to_upper(drug)
+    therapy = case_when(
+      therapy %in% c("antiige", "antiil4", "antiil5", "antitslp") ~ "Biologic",
+      therapy == "mos" ~ "LTOCS",
+      therapy == "ics" ~ "ICS only",
+      therapy == "icslaba" ~ "ICS LABA",
+      therapy == "icslabalama" ~ "ICS LABA LAMA",
+      therapy == "macrolideantibiotic" ~ "Macrolides",
+      therapy == "rhinitistherapy" ~ "Rhinitis",
+      therapy == "bronchialthermoplasty" ~ "Thermoplasty",
+      .default = str_to_upper(therapy)
     ),
-    across(contains("date"), ymd)
+    across(contains("date"), dmy)
   ) |>
-  left_join(visits |> select(visit_id, visit_date), by = join_by(visit_id)) |>
-  relocate(visit_date, .after = visit_id) |>
-  arrange(patient_id, drug, visit_date)
-# Need to get first instance of biologics and build spells
-# Can we assume they're on a drug if it's listed against the last visit?
-# Other drugs similarly duplicated
-
-# Medications Supplement ----
-
-
+  relocate(therapy, name, labeldose, freq, .after = patient_id) |>
+  arrange(patient_id, start_date, therapy)
 
 # Biologics ----
+# No rows with multiple biologics listed on same row
+# medications |> filter(rowSums(!is.na(pick(starts_with("anti")))) > 1)
+
 # Use supplement therapy file as provided rather than asthma_medications table
-bx_cln <- medications |> 
-  mutate(
-    # patient_id = str_replace(patient_id, "^ITA", "ITA_"),
-    therapy_start = str_replace(therapy_start, "UNK", "15")
-  ) |> 
-  filter(medication_class %in% c("antiige", "antiil4", "antiil5", "antitslp")) |> 
-  select(
-    where(\(x) any(!is.na(x)))
-  ) |> 
+bx_cln <- medications_cln |>
+  filter(therapy == "Biologic") |>
   select(
     patient_id,
-    bx_start_date = therapy_start,
-    bx_end_date = therapy_end,
-    contains("anti_"),
+    bx_start_date = start_date,
+    bx_end_date = end_date,
+    bx_name = name,
     bx_switchreason = biologic_switch_reason,
     bx_switch_adverse_event_grade = biologic_switch_adverse_event_grade
-  ) |> 
-  # Pivot in case of multiple drugs listed
-  pivot_longer(
-    cols = -c(patient_id, contains("date"), contains("switch")),
-    values_to = "bx_name",
-    names_to = "bx_class"
-  ) |> 
-  filter_out(is.na(bx_name)) |> 
+  ) |>
   mutate(
-    bx_start_date = dmy(bx_start_date),
-    bx_end_date = dmy(bx_end_date)
-  ) |> 
-  arrange(patient_id, bx_start_date) |> 
-  mutate(bx_name_short = structure(
-           factor(str_trim(str_remove(bx_name, " \\(.*\\)$")),
-             levels = c(
-               "Benralizumab",
-               "Dupilumab",
-               "Mepolizumab",
-               "Omalizumab",
-               "Reslizumab",
-               "Tezepelumab"
-             )
-           ),
-           label = "Biologic name"
-         ),
-         bx_type = structure(
-           case_when(
-             bx_name_short %in% c("Mepolizumab", "Reslizumab") ~ "Anti-IL5",
-             bx_name_short %in% c("Benralizumab") ~ "Anti-IL5R",
-             bx_name_short == "Omalizumab" ~ "Anti-IgE",
-             bx_name_short == "Dupilumab" ~ "Anti-IL4Ralpha",
-             bx_name_short == "Tezepelumab" ~ "Anti-TSLP"
-           ) |>
-             factor(
-               levels = c(
-                 "Anti-IgE",
-                 "Anti-IL4Ralpha",
-                 "Anti-IL5",
-                 "Anti-IL5R",
-                 "Anti-TSLP"
-               ),
-               labels = c(
-                 "Anti-IgE",
-                 "Anti-IL4Ralpha",
-                 "Anti-IL5",
-                 "Anti-IL5R",
-                 "Anti-TSLP"
-               )
-             ),
-           label = "Biologic class"
-         ),
-         bx_ongoing = structure(
-           if_else(is.na(bx_end_date), "Yes", "No") |> 
-             factor(levels = c("Yes", "No")),
-           label = "Biologic ongoing"
-         ),
-         # reason_no_clinical_efficacy = str_detect(switchreason, "No clinical efficacy"),
-         # reason_patients_choice = str_detect(switchreason, "Patient's choice"),
-         # reason_side_effects = str_detect(switchreason, "Side effects"),
-         # reason_access_restriction = str_detect(switchreason, "Restrictions on access to biological drugs"),
-         .by = patient_id) |> 
-  select(patient_id, 
-         bx_start_date,
-         bx_end_date,
-         bx_ongoing, 
-         bx_name_short, 
-         bx_type, 
-         bx_switchreason) |>
+    bx_name_short = structure(
+      factor(
+        str_trim(str_remove(bx_name, " \\(.*\\)$")),
+        levels = c(
+          "Benralizumab",
+          "Dupilumab",
+          "Mepolizumab",
+          "Omalizumab",
+          "Reslizumab",
+          "Tezepelumab"
+        )
+      ),
+      label = "Biologic name"
+    ),
+    bx_type = structure(
+      case_when(
+        bx_name_short %in% c("Mepolizumab", "Reslizumab") ~ "Anti-IL5",
+        bx_name_short %in% c("Benralizumab") ~ "Anti-IL5R",
+        bx_name_short == "Omalizumab" ~ "Anti-IgE",
+        bx_name_short == "Dupilumab" ~ "Anti-IL4Ralpha",
+        bx_name_short == "Tezepelumab" ~ "Anti-TSLP"
+      ) |>
+        factor(
+          levels = c(
+            "Anti-IgE",
+            "Anti-IL4Ralpha",
+            "Anti-IL5",
+            "Anti-IL5R",
+            "Anti-TSLP"
+          ),
+          labels = c(
+            "Anti-IgE",
+            "Anti-IL4Ralpha",
+            "Anti-IL5",
+            "Anti-IL5R",
+            "Anti-TSLP"
+          )
+        ),
+      label = "Biologic class"
+    ),
+    bx_ongoing = structure(
+      if_else(is.na(bx_end_date), "Yes", "No") |>
+        factor(levels = c("Yes", "No")),
+      label = "Biologic ongoing"
+    ),
+    # reason_no_clinical_efficacy = str_detect(switchreason, "No clinical efficacy"),
+    # reason_patients_choice = str_detect(switchreason, "Patient's choice"),
+    # reason_side_effects = str_detect(switchreason, "Side effects"),
+    # reason_access_restriction = str_detect(switchreason, "Restrictions on access to biological drugs"),
+    .by = patient_id
+  ) |>
+  select(
+    patient_id,
+    bx_start_date,
+    bx_end_date,
+    bx_ongoing,
+    bx_name_short,
+    bx_type,
+    bx_switchreason
+  ) |>
   left_join(
     patient_table |>
       select(
@@ -1092,26 +1435,62 @@ bx_cln <- medications |>
     site,
     contains("visit"),
     .after = patient_id
-  )
+  ) |>
+  arrange(patient_id, bx_start_date, bx_end_date)
+
+# Italy-specific queries, sent to NE 20261120:
+# Non-biologic naive - None found - can we confirm?
+# Duplicate start dates -	Patient has more than one record with same start date, regardless of whether therapies different or not
+# End date before start date - Row-specific, end and start dates swapped?
+# All future treatments - All of patient's start dates are after their last visit date
+# Any future treatments - Any of patient's start dates are after their last visit date
+# Missing end date - Did not include this query for Italy - can we confirm that these are "ongoing" therapies?
+# Overlapping episodes (>1 day) - same	Prior end date overlaps with next start date by more than 1 day (on the same therapy) - can we combine these episodes?
+# Overlapping episodes (>1 day) - different	Prior end date overlaps with next start date by more than 1 day (on a different therapy) - can we confirm if this is plausible, potentially "bridging" therapies? What would be the maximum overlap allowable for a check?
+# Gap on same therapy (>0 months) -	Apparent gap in treatment based on prior end date and next start date on the same therapy - can we confirm if this is plausible and why? Is there a length of time we can use to combine episodes or to identify stops?
 
 ## Exclusions ----
 # Based on those used for UK
-bx_cln_exclusions <- patient |>
-  distinct(patient_id = uidpat) |>
+bx_cln_exclusions <- patient_table |>
+  select(patient_id, date_of_birth) |>
   left_join(
     bx_cln |>
       mutate(bx_data = TRUE),
     by = join_by(patient_id)
   ) |>
-  arrange(patient_id, bx_start_date) |>
+  arrange(patient_id, bx_start_date, bx_end_date) |>
   mutate(
-    # Look at overlaps (1 day probably okay)
-    overlap = interval(
-      dplyr::lag(bx_end_date, default = first(bx_start_date)),
-      bx_start_date
+    index_age = interval(date_of_birth, min(bx_start_date)) / years(1),
+    age_at_baseline = interval(
+      date_of_birth,
+      min(bx_start_date) %m-% months(12)
     ) /
-      days(1) <
-      -1,
+      years(1),
+    # Look at overlaps (1 day probably okay)
+    overlap_same = bx_name_short ==
+      dplyr::lag(bx_name_short, default = first(bx_name_short)) &
+      interval(
+        dplyr::lag(bx_end_date, default = first(bx_start_date)),
+        bx_start_date
+      ) /
+        days(1) <
+        -1,
+    overlap_diff = bx_name_short !=
+      dplyr::lag(bx_name_short, default = first(bx_name_short)) &
+      interval(
+        dplyr::lag(bx_end_date, default = first(bx_start_date)),
+        bx_start_date
+      ) /
+        days(1) <
+        -1,
+    tx_gap = bx_name_short ==
+      dplyr::lag(bx_name_short, , default = first(bx_name_short)) &
+      interval(
+        dplyr::lag(bx_end_date, default = first(bx_start_date)),
+        bx_start_date
+      ) /
+        months(1) >
+        0,
     first_biologic = bx_start_date == min(bx_start_date),
     follow_up_mos = interval(bx_start_date, last_visit_date) / months(1),
     exclusions = case_when(
@@ -1124,7 +1503,11 @@ bx_cln_exclusions <- patient |>
       all(bx_start_date > last_visit_date) ~ "All future treatments",
       any(bx_start_date > last_visit_date) ~ "Any future treatments",
       # any(is.na(bx_end_date)) ~ "Missing end date", # Missing end date currently ongoing tx...
-      any(overlap) ~ "Overlapping episodes (>1 day)",
+      any(overlap_same) ~ "Overlapping episodes (>1 day) - same",
+      any(overlap_diff) ~ "Overlapping episodes (>1 day) - different",
+      any(tx_gap) ~ "Gap on same therapy (>0 months)",
+      age_at_baseline <
+        18 ~ "Under-18 at baseline, 12 months prior to initiation",
       any(
         first_biologic & year(bx_start_date) < 2016
       ) ~ "Started biologic before 2016",
@@ -1144,13 +1527,18 @@ bx_cln_exclusions <- patient |>
           "All future treatments",
           "Any future treatments",
           "Missing end date",
-          "Overlapping episodes (>1 day)",
+          "Overlapping episodes (>1 day) - same",
+          "Overlapping episodes (>1 day) - different",
+          "Gap on same therapy (>0 months)",
+          "Under-18 at baseline, 12 months prior to initiation",
           "Started biologic before 2016",
           "<3 months post-initiation follow-up"
         )
       ),
     exclusions_table = case_when(
       exclusions == "No biologic information" ~ "No biologic information",
+      exclusions ==
+        "Under-18 at baseline, 12 months prior to initiation" ~ "Under 18 years-old",
       exclusions == "Non-biologic naive" ~ "Non-biologic naive",
       exclusions ==
         "Started biologic before 2016" ~ "Started biologic before 2016",
@@ -1163,6 +1551,7 @@ bx_cln_exclusions <- patient |>
       factor(
         levels = c(
           "No biologic information",
+          "Under 18 years-old",
           "Non-biologic naive",
           "Data queries",
           "Started biologic before 2016",
@@ -1185,10 +1574,30 @@ bx_cln_exclusions |>
   adorn_totals() |>
   arrange(!exclusions_table == "Total")
 
+writexl::write_xlsx(
+  bx_cln_exclusions |>
+    filter(exclusions_table == "Data queries") |>
+    distinct(patient_id, exclusions),
+  here::here("data_cleaning", "ita_bx_data_queries_20261120.xlsx")
+)
+
 ## Analysis table ----
 bx_analysis <- bx_cln_exclusions |>
   filter(is.na(exclusions)) |>
-  select(-bx_data, -contains("exclusions"), -overlap) |>
+  select(
+    patient_id,
+    data_capture_system,
+    country,
+    setting,
+    site,
+    contains("visit"),
+    bx_start_date,
+    bx_end_date,
+    bx_ongoing,
+    bx_name_short,
+    bx_type,
+    bx_switchreason
+  ) |>
   # ITA outcome =
   # ITA continuers: 1 biologic episode, flagged as ongoing, or stop indicated more than a month after last visit
   # ITA stoppers: 1 biologic episode, flagged as stopped before or within a month of last visit; >1 biologic and gap between 1st and 2nd >6 months
@@ -1220,7 +1629,7 @@ bx_analysis <- bx_cln_exclusions |>
         bx_ct == 1 &
           bx_ongoing == "No" &
           (bx_end_date < last_visit_date |
-             bx_end_date <= last_visit_date %m+% months(1))
+            bx_end_date <= last_visit_date %m+% months(1))
       ) ~ "Stop", # Recorded stop before or within a month of last visit
       # any(bx_ct > 1 & gt6mos_gap) ~ "Stop", # Drop this for ATS abstract, need to define gap
       any(bx_ct > 1) ~ "Switch"
@@ -1241,181 +1650,3 @@ save(
   bx_analysis,
   file = "ita_biologic_data.Rdata"
 )
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-single <- bx_cln |> 
-  filter(bx_ct == 1)
-
-# Of patients with end dates, 50% have switch reasons
-# Assume they remain on treatment, unless there's an end date? Or assume they stop only where there's a switchreason?
-single |> filter(!is.na(bx_end_date)) |> tabyl(bx_switchreason)
-
-multiple <- bx_cln |> 
-  filter(bx_ct > 1) |> 
-  mutate(
-    benra_reliever = !is.na(bx_end_date) & bx_name_short %in% "Benralizumab" & bx_start_date==bx_end_date
-  ) |> 
-  group_by(patient_id) 
-keys  <- multiple |> group_keys() |> pull(patient_id)
-
-results <- multiple |> 
-  group_split() |>
-  set_names(nm = keys) |>
-  map(\(patient) process_patient_v3(patient), .progress = T)
-
-spells <- results |>
-  map("spells") |>
-  list_rbind() |> 
-  select(-effective_end) # not needed
-
-
-
-ITA_SITE13_4 two ongoing?
-ITA_SITE13_19 two months then stopped for several month - look within first year?
-ITA_SITE13_11 4 month gap between oma
-ITA_SITE10_45 4 month gap between mepo
-ITA_SITE366_23 Benra injection 1day for exacerbation?
-
-
-  pivot_wider(id_cols = c(patient_id, bx_ct),
-              names_from = bx_nbr,
-              values_from = -c(patient_id, bx_ct),
-              names_vary = "slowest") |> 
-  mutate(overlaps =
-           case_when(
-             end_date_1 > start_date_2 ~ TRUE,
-             end_date_2 > start_date_3 ~ TRUE,
-             end_date_3 > start_date_4 ~ TRUE,
-             end_date_4 > start_date_5 ~ TRUE,
-             
-           ))
-# 1) pivot wide
-# 2) overlaps?
-# 3) same drug - minimal gap < 3 months?
-
-
-process_patient_v3 <- function(patient_data, month_gap_allowed = 3) {
-  patient_id <- patient_data |> distinct(patient_id) |> pull()
-  
-  spells <- patient_data |>
-    filter_out(is.na(start_date)) |>
-    arrange(start_date, end_date) |>
-    # ID instances of biologic use in chronological order
-    mutate(
-      change_med = bx_name != dplyr::lag(bx_name, default = first(bx_name)),
-      change = if_else(
-        bx_name != dplyr::lag(bx_name, default = first(bx_name)),
-        1,
-        0
-      ),
-      bx_id = cumsum(as.integer(change)) + 1
-    ) |>
-    # Within instance flag rows to create spells
-    mutate(
-      running_max = purrr::accumulate(end_date, max),
-      prev_max = dplyr::lag(running_max, default = first(end_date)),
-      new_spell = start_date > prev_max %m+% months(month_gap_allowed),
-      .by = bx_id
-    ) |>
-    mutate(spell_id = cumsum(new_spell), .by = bx_id) |>
-    # Within instance summarise rows to create spells
-    summarise(
-      spell_start = min(start_date),
-      spell_end = max(end_date),
-      .by = c(bx_id, bx_name, spell_id)
-    ) |>
-    mutate(
-      patient_id = patient_id,
-      .before = 1
-    ) |>
-    arrange(bx_id, spell_start) |>
-    mutate(
-      next_spell_start = lead(spell_start),
-      effective_end = if_else(is.na(spell_end), next_spell_start, spell_end),
-      .by = bx_id
-    ) |>
-    select(
-      patient_id,
-      bx_name,
-      bx_id,
-      spell_start,
-      spell_end,
-      effective_end
-    ) |>
-    arrange(spell_start)
-  
-  # Rows with no start_date or end_date: confirm  drug is present in listed spells.
-  dropped_rows_missing_all_dates <- patient_data |>
-    filter(when_all(is.na(start_date), is.na(end_date))) |>
-    distinct(bx_name, .keep_all = T) |>
-    rowwise() |>
-    mutate(
-      biologic_listed = bx_name %in% spells$bx_name
-    ) |>
-    ungroup()
-  
-  # Rows with no start_date: check whether end_date inside spell for same drug,
-  # using effective_end (start of next spell for that drug) for intervals with no end date.
-  # TRUE = already covered, safe to drop; FALSE = not covered by any known
-  # treatment window, review manually.
-  dropped_rows_missing_start_dates <- patient_data |>
-    filter(when_all(is.na(start_date), !is.na(end_date))) |>
-    rowwise() |>
-    mutate(
-      end_date_in_known_spell = any(
-        spells$bx_name == bx_name &
-          spells$spell_start <= end_date & end_date <= spells$effective_end,
-        na.rm = TRUE
-      )
-    ) |>
-    ungroup()
-  
-  list(
-    spells = spells,
-    dropped_rows_missing_all_dates = dropped_rows_missing_all_dates,
-    dropped_rows_missing_start_dates = dropped_rows_missing_start_dates
-  )
-}
-
-
-# Dictionary ----
-variable_list <- ita_data |>
-  imap(\(table, tablename) {
-    vars <- names(table)
-    
-    vars |>
-      map(\(var) {
-        vals <- unique(table[[var]])
-        tibble(
-          qisar2_table = tablename,
-          qisar2_variable = var,
-          qisar2_values = paste(
-            if (length(vals) < 5) vals else vals[1:5],
-            collapse = ", "
-          )
-        )
-      }) |>
-      list_rbind()
-  }) |>
-  list_rbind() |>
-  mutate(
-    n = row_number(),
-    .by = qisar2_table
-  )
-# 
-# write_xlsx(variable_list, "qisar2_ita_data_dictionary.xlsx")
