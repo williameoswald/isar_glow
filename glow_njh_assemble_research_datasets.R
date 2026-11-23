@@ -11,6 +11,12 @@ library(janitor)
 # Comorbidities
 # LTOCS - pending
 
+# 20261109 - need to convert patients to bx_cln_exclusions to match other sites?
+
+# Notes ----
+# 20261109 - realised that needed to comment out "any missing start dates" in
+# exclusions steps to get 20261015 feasibility numbers.
+
 # Pull NJH data ----
 ## Connect to ISAR SQL tables
 connection <- RODBC::odbcDriverConnect(
@@ -267,7 +273,7 @@ bx_cln <- biologics |>
       any(
         month(start_date) == 1 & day(start_date) == 1
       ) ~ "Unreliable start date - Imputed",
-      # any(is.na(start_date)) ~ "Missing a biologic initiation date",
+      # any(is.na(start_date)) ~ "Missing a biologic initiation date", #Comment out this line and in factor below to get 20261015 feasibility number
       .default = NA_character_
     ) |>
       factor(
@@ -280,7 +286,7 @@ bx_cln <- biologics |>
           "No start dates provided",
           "Unreliable start date - Reported",
           "Unreliable start date - Imputed"
-          # "Missing a biologic initiation date"
+          # "Missing a biologic initiation date" #Comment out this line and in factor below to get 20261015 feasibility number
         )
       ),
     .by = patient_id
@@ -320,7 +326,7 @@ patients <- bx_cln |>
   ) |>
   mutate(
     country = "USA",
-    setting = "NJH",
+    setting = "USA - NJH",
     data_capture_system = "Bespoke",
     exclusions = case_when(
       is.na(exclusions) &
@@ -341,6 +347,7 @@ patients <- bx_cln |>
           "No start dates provided",
           "Unreliable start date - Reported",
           "Unreliable start date - Imputed",
+          # "Missing a biologic initiation date",
           "Started first biologic before first observation",
           "Duplicated start date - multiple biologic",
           "<3 months post-initiation follow-up"
@@ -386,16 +393,15 @@ patients <- bx_cln |>
 patients |>
   tabyl(exclusions) |>
   adorn_totals()
+patients |>
+  tabyl(exclusions_table) |>
+  adorn_totals()
 
 patients |>
   tabyl(exclusions) |>
   adorn_pct_formatting() |>
   kable() |>
   kable_styling()
-
-eligible <- patients |>
-  filter(is.na(exclusions)) |>
-  pull(patient_id)
 
 index_dates <- patients |>
   # Restrict to eligible for obj1
@@ -428,8 +434,9 @@ index_dates <- patients |>
 #   ) |>
 #   mutate(n_obs = n(), .by = patient_id)
 
+## Biologic episodes ----
 # 20261015 Use spells approach rather than first start
-bx_episodes <- bx_cln |>
+bx_analysis <- bx_cln |>
   # Selects eligible patients
   right_join(index_dates, by = join_by(patient_id)) |>
   relocate(
@@ -449,25 +456,13 @@ bx_episodes <- bx_cln |>
       0
     ),
     bx_nbr = cumsum(as.integer(change)) + 1,
-    # Base change on biologic names
-    any_change = any(change == 1),
     .by = c(patient_id)
   ) |>
   summarise(
-    any_change = first(any_change),
     bx_start_date = min(bx_start_date, na.rm = T),
     bx_name_short = first(bx_name_short),
     bx_type = first(bx_type),
     .by = c(patient_id, bx_nbr)
-  ) |>
-  mutate(
-    bx_ct = max(bx_nbr),
-    # Outcome based on number of spells
-    outcome = case_when(
-      bx_ct == 1 ~ "Continuer",
-      bx_ct > 1 ~ "Switch"
-    ),
-    .by = patient_id
   ) |>
   left_join(
     patients |>
@@ -481,322 +476,71 @@ bx_episodes <- bx_cln |>
         index_date
       ),
     by = join_by(patient_id)
-  )
+  ) |>
+  relocate(
+    data_capture_system,
+    country,
+    setting,
+    first_visit_date,
+    last_visit_date,
+    index_date,
+    .after = patient_id
+  ) |>
+  mutate(
+    follow_up_mos = interval(index_date, last_visit_date) / months(1),
+    bx_ct = max(bx_nbr),
+    # Outcome based on number of spells
+    outcome = case_when(
+      bx_ct == 1 ~ "Continue",
+      bx_ct > 1 ~ "Switch"
+    ),
+    .by = patient_id
+  ) |>
+  relocate(bx_nbr, .before = bx_ct)
 
-bx_episodes |>
+bx_analysis |>
   distinct(patient_id, .keep_all = T) |>
   tabyl(outcome) |>
   adorn_totals()
 
+njh_bx_cln <- bx_cln
+njh_patients <- patients
+njh_bx_analysis <- bx_analysis
+
+save(
+  njh_bx_cln,
+  njh_patients,
+  njh_bx_analysis,
+  file = "njh_biologic_data.Rdata"
+)
+
 ## Switch dates ----
 # Keep second record for switchers
-switch_dates <- spells |>
+# 20261110 - this matches 20261015 feasibility numbers, n=299
+switch_dates <- bx_analysis |>
   filter(
-    spell_ct > 1,
-    spell_id == 2
+    bx_ct > 1,
+    bx_nbr == 2
   ) |>
-  left_join(index_dates, by = join_by(patient_id)) |>
+  # left_join(index_dates, by = join_by(patient_id)) |>
   mutate(
-    followup_mos = interval(switch_date, last_visit_date) / months(1),
+    followup_mos = interval(bx_start_date, last_visit_date) / months(1),
     eligible_fup = followup_mos >= 11,
-    post_switch_date = switch_date %m+% months(12)
+    post_switch_date = bx_start_date %m+% months(12)
   ) |>
   select(
     patient_id,
     first_visit_date,
     last_visit_date,
     index_date,
-    switch_date,
+    switch_date = bx_start_date,
     post_switch_date,
     followup_mos,
     eligible_fup
   ) |>
   filter(eligible_fup)
 
-
 # US_NJH_14691 exclude for now - looks like they had a historic reported use of Oma
-
-# 615 patients with only 1 medicine
-# NOTE - May have gaps in treatment on same med
-# Need to define stops
-# Restrict to first 2 years
-single_med <- switch_dates |>
-  filter(all(change == 0), .by = patient_id) |>
-  arrange(start_date, observation_date, end_date) |>
-  mutate(
-    # Ignore starts 24 + 3 months after first initiation
-    ignore_record = !is.na(start_date) &
-      (start_date > index_date %m+% months(27))
-  )
-summarise(
-  n_obs = n(),
-  first_visit_date = first(first_visit_date),
-  last_visit_date = last(last_visit_date),
-  start_date = min(start_date, na.rm = T),
-  end_date1 = last(end_date), #Don't exclude missing
-  end_date2 = max(end_date, na.rm = F), #Don't exclude missing
-  end_date3 = max(end_date, na.rm = T), #Exclude missing
-  bx_name = paste(unique(na.omit(bx_name)), collapse = ", "),
-  bx_type = paste(unique(na.omit(bx_type)), collapse = ", "),
-  .by = patient_id
-) |>
-  mutate(
-    stop1 = !is.na(end_date1),
-    stop2 = !is.na(end_date2),
-    stop3 = !is.na(end_date3),
-    censor_date = start_date %m+% months(12)
-  )
-
-# Single med spells
-single_med_results <- switch_dates |>
-  filter(all(change == 0), .by = patient_id) |>
-  arrange(start_date, observation_date, end_date) |>
-  # mutate(
-  #   # Ignore starts 24 + 3 months after first initiation
-  #   ignore_record = !is.na(start_date) &
-  #     (start_date > index_date %m+% months(27))
-  # ) |>
-  group_by(patient_id) |>
-  group_split() |>
-  map(\(patient) process_patient_v2(patient), .progress = T)
-
-single_med_spells <- single_med_results |>
-  map("spells") |>
-  list_rbind()
-write_xlsx(single_med_spells, "single_med_spells_20261001.xlsx")
-dropped_rows_all <- single_med_results |>
-  map("dropped_rows_missing_all_dates") |>
-  list_rbind()
-dropped_rows_start <- single_med_results |>
-  map("dropped_rows_missing_start_dates") |>
-  list_rbind()
-
-
-# Discontinuation date only different for 49 patients (1.5%)
-# stop1 = stop2 = stop3 for 110 patients, meaning
-# end_date approach doesn't matter if only 1 row
-# 75 (52%) of patients with 1 row have missing end_date
-# 68 of patients with 1 row have all the same end_date summarised results
-
-# TO DO - define stoppers as end date before observation date?
-
-switchers <- switch_dates |>
-  filter(any(change != 0), .by = patient_id) |>
-  summarise(
-    start_date = min(start_date, na.rm = T),
-    bx_type = first(bx_type),
-    .by = c(patient_id, bx_name)
-  )
-
-## Bx spells ----
-# Row missing all dates (among patients with some dates) - check that biologic is already listed for patient
-missing_all_dates <- bx_cln |>
-  filter(is.na(exclusions)) |>
-  filter(when_all(is.na(start_date), is.na(end_date))) |>
-  distinct(patient_id, bx_name, bx_type, .keep_all = T)
-# Note - all of these records are reported by patient
-
-# Check treatment rows with only end dates based on missing start dates are already in spells
-missing_start_dates <- bx_cln |>
-  filter(is.na(exclusions)) |>
-  filter(when_all(is.na(start_date), !is.na(end_date))) |>
-  select(patient_id, bx_name, bx_type, start_date, end_date)
-
-# Treatment spells defined excluding rows with missing start dates
-# NB - Need to decide how to approach concurrent treatments
-spells <- bx_cln |>
-  filter(is.na(exclusions)) |>
-  # Exclude rows with missing start dates
-  filter_out(is.na(start_date)) |>
-  arrange(patient_id, start_date) |>
-  mutate(
-    bx_interval = interval(start_date, end_date),
-    change_med = bx_name != dplyr::lag(bx_name, default = first(bx_name)),
-    date_overlap = start_date %within% dplyr::lag(bx_interval),
-    change = if_else(
-      bx_name != dplyr::lag(bx_name, default = first(bx_name)),
-      1,
-      0
-    ),
-    spell_id = cumsum(as.integer(change)) + 1,
-    .by = c(patient_id)
-  ) |>
-  relocate(
-    bx_interval,
-    change_med,
-    date_overlap,
-    change,
-    spell_id,
-    .after = end_date
-  ) |>
-  mutate(
-    spell_start_date = min(start_date, na.rm = TRUE),
-    spell_end_date = max(end_date, na.rm = TRUE),
-    .by = c(patient_id, spell_id)
-  ) |>
-  mutate(
-    spell_ct = max(spell_id),
-    .by = patient_id
-  ) |>
-  # summarise(start_date = min(start_date, na.rm = TRUE),
-  #           end_date = max(end_date, na.rm = TRUE),
-  #           .by = c(patient_id, first_visit_date, last_visit_date, bx_name, bx_type, spell_id, exclusions)) |>
-  arrange(patient_id, start_date) |>
-  relocate(contains("spell"), .after = end_date) |>
-  distinct(
-    patient_id,
-    first_visit_date,
-    last_visit_date,
-    bx_name,
-    bx_type,
-    spell_id,
-    spell_ct,
-    spell_start_date,
-    spell_end_date
-  )
-
-# Check 1 - row only lists biologic, no dates, so see if biologic already listed, exclude patient if not
-# Patient reported drug already in list
-ok_to_include_patient <- spells |>
-  left_join(
-    missing_all_dates |>
-      select(patient_id, bx_name, start_date, end_date, historicalorreported) |>
-      mutate(ok = TRUE),
-    by = join_by(patient_id, bx_name),
-    relationship = "many-to-one"
-  ) |>
-  filter(any(ok), .by = patient_id)
-# Patient reported drug not in list
-# Note - These look to be cases where either a different drug is reported by patient
-# or the same drug is already listed but without a start date so it's been excluded
-# from the spells dataset
-patient_to_exclude <- missing_all_dates |>
-  anti_join(
-    spells,
-    by = join_by(patient_id, bx_name)
-  ) |>
-  distinct(patient_id) |>
-  pull(patient_id)
-checking <- bx_cln |>
-  filter(patient_id %in% to_exclude)
-
-# Check 2 - biologic listed with only an end date. See if biologic is listed
-# and date overlaps with existing interval.
-# Test rows with missing start dates against existing spells to see if they're accounted for already
-ok_to_include_patient2 <- missing_start_dates |>
-  inner_join(
-    spells,
-    by = join_by(
-      patient_id,
-      bx_name,
-      between(end_date, spell_start_date, spell_end_date)
-    )
-  )
-patient_to_exclude2 <- missing_start_dates |>
-  anti_join(ok_to_include_patient2, by = join_by(patient_id, bx_name)) |>
-  pull(patient_id)
-
-## Clean spells ----
-spells_cln <- spells |>
-  filter_out(patient_id %in% patient_to_exclude) |>
-  filter_out(patient_id %in% patient_to_exclude2) |>
-  mutate(
-    spell_end_date = if_else(
-      is.infinite(spell_end_date),
-      last_visit_date,
-      spell_end_date
-    ),
-    tx_months = round(interval(spell_start_date, spell_end_date) / months(1), 2)
-  ) |>
-  mutate(
-    spell_overlap = int_overlaps(
-      interval(spell_start_date, spell_end_date),
-      dplyr::lag(interval(spell_start_date, spell_end_date))
-    ),
-    spell_overlap_mos = if_else(
-      spell_overlap,
-      interval(spell_start_date, dplyr::lag(spell_end_date)) / months(1),
-      NA
-    ),
-    spell_overlap_same_bx = if_else(
-      spell_overlap & spell_overlap_mos > 0,
-      bx_name == dplyr::lag(bx_name),
-      NA
-    ),
-    .by = patient_id
-  )
-# Note - need to think about overlaps - are these switches or should we look at concurrent treatments?
-
-#### Plot spells ----
-# Define biologic order
-bx_levels <- c(
-  "Depemokimab",
-  "Tezepelumab",
-  "Benralizumab",
-  "Dupilumab",
-  "Reslizumab",
-  "Mepolizumab",
-  "Omalizumab"
-)
-
-# Named colours keyed to those levels
-bx_colours <- setNames(
-  RColorBrewer::brewer.pal(7, "Set2"),
-  bx_levels
-)
-
-totest <- spells_cln |>
-  filter(spell_ct > 1) |>
-  distinct(patient_id) |> #n=507 patients with multiple spells
-  slice_sample(n = 10) |>
-  pull(patient_id)
-spells_cln |>
-  filter(patient_id %in% totest) |>
-  mutate(
-    spell_id = as.factor(spell_id),
-    spell_end_date_imputed = if_else(spell_end_date == "-Inf", "Yes", "No"),
-    spell_end_date = case_when(
-      spell_end_date == "-Inf" ~ last_visit_date,
-      .default = spell_end_date
-    )
-  ) |>
-  ggplot() +
-  geom_segment(
-    aes(
-      y = spell_id,
-      yend = spell_id,
-      x = spell_start_date,
-      xend = spell_end_date,
-      colour = bx_name
-    ),
-    size = 6,
-    position = position_nudge(y = 0.12)
-  ) +
-  geom_point(
-    aes(
-      y = spell_id,
-      x = spell_end_date,
-      fill = bx_name,
-      colour = bx_name,
-      shape = spell_end_date_imputed
-    ),
-    size = 6,
-    position = position_nudge(y = 0.12),
-    show.legend = c(shape = TRUE, fill = FALSE, colour = FALSE)
-  ) +
-  scale_colour_manual(values = bx_colours) +
-  scale_fill_manual(values = bx_colours) +
-  scale_y_discrete() +
-  scale_shape_manual(values = c(NA, 4)) +
-  scale_x_date(
-    date_labels = "%Y",
-    date_breaks = "year",
-    limits = as.Date(c("2004-01-01", "2026-12-31"))
-  ) +
-  facet_wrap(vars(patient_id), ncol = 1, scales = "free_y")
-
-# Look at start dates by FDA approval + six months
-# Check patients on multiple biologics manually
 
 # Demographics ----
 # "current age" provided by NJH in earlier transfers, understood to be age at extraction
@@ -944,11 +688,6 @@ bl_ac <- asthma_control |>
   ) |>
   slice_head(n = 1, by = patient_id)
 
-### Switch date ----
-# Closest to switch
-### Post-switch ----
-# Closest to 12 months after switch
-
 # Exacerbations ----
 # For now assume all listed are exacerbation - SCORING IN PROGRESS
 exac_cln <- exacerbationdetails |>
@@ -992,9 +731,6 @@ bl_exac_num <- exac_cln |>
   # Only count among patients with sufficient followup
   filter(followup_ok) |>
   summarise(bl_exac_num = sum(include_exac), .by = patient_id)
-
-### Switch date ----
-### Post-switch ----
 
 # Comorbidities ----
 comorbidities_cln <- comorbidities |>
