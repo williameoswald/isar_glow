@@ -65,14 +65,14 @@ ita_data <- c(
     )
   })
 
-save(ita_data, file = "qisar2_ita_data.RData")
+save(ita_data, file = here::here("datasets", "qisar2_ita_data.RData"))
 
 close(connection)
 
 # Specifications ----
 
 # Load data ----
-load("qisar2_ita_data.RData")
+load(here::here("datasets", "qisar2_ita_data.RData"))
 
 #Split named list into objects
 list2env(ita_data, envir = .GlobalEnv)
@@ -781,6 +781,16 @@ ita_biomarkers <- biomarkers |>
     reduce_function = "max",
     flag_only = F,
     keep_flags = F
+  ) |>
+  mutate(
+    result = case_when(
+      # Truncate IgE and FeNO counts (same as NJH)
+      test == "ige" & result <= 2 ~ 2,
+      test == "ige" & result >= 5000 ~ 5000,
+      test == "feno" & result <= 5 ~ 5,
+      test == "feno" & result >= 300 ~ 300,
+      .default = result
+    )
   )
 
 # Medications ----
@@ -839,8 +849,8 @@ ita_medications <- medications |>
       therapy %in% c("antiige", "antiil4", "antiil5", "antitslp") ~ "Biologic",
       therapy == "mos" ~ "LTOCS",
       therapy == "ics" ~ "ICS only",
-      therapy == "icslaba" ~ "ICS LABA",
-      therapy == "icslabalama" ~ "ICS LABA LAMA",
+      therapy == "icslaba" ~ "ICSLABA",
+      therapy == "icslabalama" ~ "ICSLABALAMA",
       therapy == "macrolideantibiotic" ~ "Macrolides",
       therapy == "rhinitistherapy" ~ "Rhinitis",
       therapy == "bronchialthermoplasty" ~ "Thermoplasty",
@@ -966,5 +976,5 @@ save(
   ita_biomarkers,
   ita_medications,
   ita_biologics,
-  file = here::here("datasets", "ita_srd.Rdata")
+  file = here::here("datasets", "qisar2_ita_srd.Rdata")
 )
