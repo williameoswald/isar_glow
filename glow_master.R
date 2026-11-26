@@ -72,8 +72,9 @@ source(
   "C:/Users/William.Oswald/OneDrive - Optimum Patient Care Global Limited/Documents/Github/useful/r_summary_table_v2.R"
 )
 
-# ASSEMBLE DATA ----
-
+# LOAD DATA ----
+## SRD v1 ----
+# Use this for countries with pending rebuilds
 dictionary <- readxl::read_xlsx(
   here::here(datapath, "documentation", "ISAR SRD Data Dictionary v1.0.xlsx")
 )
@@ -86,10 +87,63 @@ filenames <- list.files(
 
 # Map over all listed files or select specific datasets
 # filenames <- filenames[filenames != "7. HCRU.csv"] or filenames[c(1, 4)]
-# Will create new objects in global environment for each dataset
+# Will create new objects in "isar" environment for each dataset
+isar <- new.env()
 filenames |>
   purrr::set_names() |>
-  purrr::map(\(x) import_datasets(x, keep_raw = F), .progress = T)
+  purrr::map(
+    \(x) import_datasets(x, keep_raw = F, output_env = isar),
+    .progress = T
+  )
 
-# BASELINE ASSEMBLY ----
-# source("1_baseline.R")
+### SRD v1 biologic data ----
+source("biologics.R")
+
+## QISAR2 ----
+# See "isar_srd" scripts
+# Load QISAR2/SRD data into respective environments and process
+# for GLOW eligibility, objective 1 analysis, and baseline
+uk <- new.env()
+# See "isar_srd/assemble_research_datasets_uk.R"
+load(here::here("datasets", "qisar2_srd_uk.Rdata"), envir = uk)
+ita <- new.env()
+# See "isar_srd/assemble_research_datasets_ita.R"
+load(here::here("datasets", "qisar2_srd_ita.Rdata"), envir = ita)
+prt <- new.env()
+# See "isar_srd/assemble_research_datasets_prt.R"
+load(here::here("datasets", "qisar2_srd_prt.Rdata"), envir = prt)
+njh <- new.env()
+# See "isar_srd/assemble_research_datasets_njh.R"
+load(here::here("datasets", "qisar2_srd_njh.Rdata"))
+
+### QISAR2 biologic data ----
+# 1) Creates biologics analysis dataset and flag eligible patients
+# 2) Assemble eligible initiation date and index (switch/stop) dates for querying SRD
+source("glow_eligibility.R")
+
+## BASELINE ASSEMBLY ----
+# Query datasets for baseline measures, using bx_initiation_date
+source("glow_baseline.R")
+
+# OBJ1 ANALYSIS ----
+source("glow_analysis_obj1.R")
+
+# SWITCH/STOP ASSEMBLY ----
+# Query datasets for pre/post measures, using switchstop_date
+# source("glow_prepost.R")
+
+# OBJ2 ANALYSIS ----
+# source("glow_analysis_obj2.R")
+
+# REPORT ----
+
+rmarkdown::render(
+  "GLOW_internal_results_tables_and_figures.rmd",
+  encoding = "UTF-8",
+  output_file = paste0(
+    "GLOW_internal_results_tables_and_figures_",
+    format(Sys.Date(), "%Y%m%d"),
+    ".docx"
+  ),
+  output_dir = "report"
+)
