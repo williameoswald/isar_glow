@@ -2,8 +2,9 @@
 # Assemble biologics dataset, SRD no longer separating biologics,
 # so reproduce steps here using the full medications table.
 # 20261015 - revised to use 3 months' follow-up, not 12
+# 20261125 - revised to match objects to bespoke processing
 
-meds <- medications_labelled |>
+isar_biologics <- isar$medications_labelled |>
   remove_empty_imputation_fields() |>
   filter(med_class == "Biologic" & med_yn == "Yes") |>
   # filter_out(is.na(med_name)) |>
@@ -85,36 +86,35 @@ meds <- medications_labelled |>
     bx_ongoing_imputed = ifelse(!is.na(bx_ongoing_imputed_flag), 1, 0)
   ) |>
   relocate(bx_name_short, bx_type, .after = bx_name) |>
-  # Added distinct 20260812, this is the final step in the biolotics_table.R script
+  # Added distinct 20260812, this is the final step in the biologics_table.R script
   distinct()
 
-index_dates <- visit_labelled |>
-  slice_min(visit_date, by = patient_id, with_ties = F) |>
-  select(patient_id, first_visit_date = visit_date) |>
-  left_join(
-    meds |>
-      slice_min(bx_start_date, by = patient_id, with_ties = F) |>
-      select(patient_id, bx_start_date),
-    by = join_by(patient_id)
-  ) |>
-  mutate(
-    index_date = coalesce(bx_start_date, first_visit_date)
-  )
+# index_dates <- visit_labelled |>
+#   slice_min(visit_date, by = patient_id, with_ties = F) |>
+#   select(patient_id, first_visit_date = visit_date) |>
+#   left_join(
+#     meds |>
+#       slice_min(bx_start_date, by = patient_id, with_ties = F) |>
+#       select(patient_id, bx_start_date),
+#     by = join_by(patient_id)
+#   ) |>
+#   mutate(
+#     index_date = coalesce(bx_start_date, first_visit_date)
+#   )
 
-## Analysis ----
-bx_cln <- patient_labelled |>
-  filter_out(country == "Denmark") |>
-  filter_out(country == "UK") |>
+## Exclusions ----
+isar_bx_cln_exclusions <- isar$patient_labelled |>
+  filter_out(country %in% c("Denmark", "UK", "Italy", "Portugal")) |>
   filter_out(str_detect(patient_id, "NJH")) |>
   remove_empty_imputation_fields() |>
   select(-data_capture_system) |>
-  left_join(
-    index_dates |> select(patient_id, index_date),
-    by = join_by(patient_id)
-  ) |>
+  # left_join(
+  #   index_dates |> select(patient_id, index_date),
+  #   by = join_by(patient_id)
+  # ) |>
   #   Demographics - add age and index_date, confirm the latter
   left_join(
-    demographics_labelled |>
+    isar$demographics_labelled |>
       # Can't use clean function for now because no index_age
       select(
         patient_id,
@@ -125,7 +125,7 @@ bx_cln <- patient_labelled |>
   ) |>
   #   Left join to keep patients without biologic data for consort
   left_join(
-    meds |>
+    isar_biologics |>
       #   Reverse imputation for now
       mutate(
         # bx_start_date = structure(
@@ -153,7 +153,6 @@ bx_cln <- patient_labelled |>
     by = "patient_id",
     relationship = "one-to-many"
   ) |>
-  # filter(country %in% c("UK", "Denmark", "Spain", "Italy", "USA")) |>
   group_by(patient_id) |>
   #   Flag issues
   arrange(bx_start_date) |>
@@ -229,8 +228,9 @@ bx_cln <- patient_labelled |>
   fill(contains("err"), .direction = "downup") |>
   unite("errors", contains("err"), sep = ", ", na.rm = T, remove = F) |>
   mutate(
-    bx_start_year = year(bx_start_date),
-    index_age = interval(ymd(date_of_birth), index_date) / years(1),
+    bx_initiation_year = year(bx_start_date),
+    bx_initiation_age = interval(ymd(date_of_birth), min(bx_start_date)) /
+      years(1),
     follow_up_mos = if_else(
       is.na(bx_start_date),
       NA,
@@ -240,14 +240,15 @@ bx_cln <- patient_labelled |>
       all(is.na(bx_flag)) ~ "Not in biologic data",
       all(num_of_visits == 0) ~ "No visits recorded", # means no visit dates for imputation
       country %in% c("Ecuador", "Qatar") ~ "Fewer than two biologics available",
-      any(bx_start_year < 2016) ~ "Biologic start date before 2016",
-      index_age < 18 ~ "Under-18",
+      any(bx_initiation_year < 2016) ~ "Biologic start date before 2016",
+      bx_initiation_age < 18 ~ "Under-18",
       any(is.na(bx_name)) ~ "Biologic name not listed",
       any(is.na(bx_start_date)) ~ "Biologic start date not listed",
       any(exclude_imp_date) ~ "Imputed start/end MonthsDays",
       # max(1:n()) > 6 ~ "More than 6 listed treatments",
       any(errors != "") ~ "Flagged errors",
       follow_up_mos < 3 ~ "Less than 3 months of follow-up",
+      patient_id == "CAN_S11_14" ~ NA, # 2017 Teze patient
       .default = "Eligible"
     ) |>
       factor(
@@ -266,6 +267,28 @@ bx_cln <- patient_labelled |>
           "Eligible"
         )
       ),
+    exclusions_table = case_when(
+      exclusions == "Not in biologic data" ~ "Non-biologic patient",
+      exclusions == "Under-18" ~ "Under-18",
+      exclusions == "Non-biologic naive" ~ "Non-biologic naive",
+      exclusions ==
+        "Biologic start date before 2016" ~ "Started biologic before 2016",
+      exclusions ==
+        "Less than 3 months of follow-up" ~ "<3 months post-initiation follow-up",
+      exclusions == "Eligible" ~ "Eligible",
+      .default = "Data queries"
+    ) |>
+      factor(
+        levels = c(
+          "Non-biologic patient",
+          "Under-18",
+          "Non-biologic naive",
+          "Data queries",
+          "Started biologic before 2016",
+          "<3 months post-initiation follow-up",
+          "Eligible"
+        )
+      )
     # country = if_else(
     #   is.na(country),
     #   str_extract(patient_id, "^[^_]+"),
@@ -303,8 +326,23 @@ error_summary |>
   arrange(country, error_flag)
 error_summary |> view()
 
-# Biologic history ----
-bx_analysis <- bx_cln |>
+### Table ----
+# See "20261015_srd_feasibility.R"
+# Excluding only NJH, Denmark, and UK matches earlier feasibility numbers
+isar_bx_cln_exclusions |>
+  distinct(patient_id, exclusions) |>
+  tabyl(exclusions) |>
+  adorn_totals() |>
+  arrange(!exclusions == "Total")
+
+isar_bx_cln_exclusions |>
+  distinct(patient_id, exclusions_table) |>
+  tabyl(exclusions_table) |>
+  adorn_totals() |>
+  arrange(!exclusions_table == "Total")
+
+## Analysis ----
+isar_bx_analysis <- isar_bx_cln_exclusions |>
   # Drop patients with errors
   filter(
     when_any(
@@ -324,6 +362,8 @@ bx_analysis <- bx_cln |>
   arrange(patient_id, bx_start_date) |>
   # Assign earlier end date as subsequent start date in these cases
   mutate(
+    bx_initiation_date = min(bx_start_date),
+    follow_up_mos = interval(bx_initiation_date, last_visit_date) / months(1),
     bx_nbr = row_number(),
     bx_ct = n(),
     prev_end_date = dplyr::lag(bx_end_date),
@@ -360,10 +400,7 @@ bx_analysis <- bx_cln |>
     ),
     .by = patient_id
   ) |>
-  arrange(patient_id, bx_start_date)
-
-isar_bx_cln <- bx_cln
-isar_bx_analysis <- bx_analysis |>
+  arrange(patient_id, bx_start_date) |>
   rename(site = setting) |>
   mutate(
     setting = case_when(
@@ -376,4 +413,9 @@ isar_bx_analysis <- bx_analysis |>
     )
   )
 
-save(isar_bx_cln, isar_bx_analysis, file = "isar_biologic_data.RData")
+save(
+  isar_biologics,
+  isar_bx_cln_exclusions,
+  isar_bx_analysis,
+  file = here::here("datasets", "biologic_data_isar.RData")
+)
