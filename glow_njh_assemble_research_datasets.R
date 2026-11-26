@@ -68,7 +68,7 @@ njh_data <- c(
 
 # Pending: bronchial thermoplasty; LTOCS
 
-save(njh_data, file = "qisar2_njh_data.RData")
+save(njh_data, file = "qisar2_data_njh.RData")
 
 close(connection)
 
@@ -133,7 +133,7 @@ all_observation_dates <- njh_data |>
 
 visit_summary <- all_observation_dates |>
   summarise(
-    num_of_visits = n(),
+    num_of_visits = n_distinct(observation_date),
     first_visit_date = min(observation_date, na.rm = TRUE),
     last_visit_date = max(observation_date, na.rm = TRUE),
     .by = patient_id
@@ -200,7 +200,10 @@ njh_patients <- demographics |>
   # relocate(index_date, .after = last_visit_date) |>
   mutate(
     observation_date = ymd(observation_date),
-    date_of_birth = make_date(year = year_of_birth, month = 7, day = 2),
+    date_of_birth = structure(
+      make_date(year = year_of_birth, month = 7, day = 2),
+      label = "Date of birth, imputed month and year"
+    ),
     gender = structure(
       factor(gender, levels = c(1, 2), labels = c("Male", "Female")),
       label = "Gender"
@@ -215,7 +218,7 @@ njh_patients <- demographics |>
     ),
     country = structure("USA", label = "Country"),
     setting = structure("USA - NJH", label = "Setting"),
-    site = structure("USA-NJH", label = "Site"),
+    site = structure("NJH", label = "Site"),
     data_capture_system = structure("Bespoke", label = "Data capture system"),
   ) |>
   arrange(patient_id, observation_date) |>
@@ -227,7 +230,25 @@ njh_patients <- demographics |>
     -contains("smoke_"),
     -contains("occupation")
   ) |>
-  distinct(patient_id, gender, date_of_birth, smoking_status)
+  left_join(
+    visit_summary,
+    by = join_by(patient_id)
+  ) |>
+  distinct(
+    patient_id,
+    country,
+    setting,
+    site,
+    first_visit_date,
+    last_visit_date,
+    num_of_visits,
+    data_capture_system,
+    gender,
+    date_of_birth
+    # ethnicity,
+    # asthma_onset,
+    # asthma_onset_cat
+  )
 
 get_dupes(demographics_cln, patient_id) |> view()
 
@@ -868,7 +889,7 @@ njh_medications <- medication |>
 # Biologics ----
 # Discontinuation date is between 1 and 39 days after the end_date, can probably ignore
 njh_biologics <- biologics |>
-  left_join(njh_visits, by = join_by(patient_id)) |>
+  left_join(visit_summary, by = join_by(patient_id)) |>
   relocate(contains("visit"), .after = patient_id) |>
   rename_with(~ str_remove(.x, "medication_"), contains("medication")) |>
   rename_with(~ str_replace(.x, "biologic_", "bx_"), contains("biologic")) |>
@@ -932,15 +953,15 @@ njh_biologics <- biologics |>
 save(
   njh_visits,
   njh_patients,
-  njh_lifestyle,
-  njh_comorbidities,
-  njh_allergens,
-  njh_hcru,
-  njh_exacerbations,
-  njh_asthma_control,
-  njh_spirometry,
-  njh_biomarkers,
-  njh_medications,
+  # njh_lifestyle,
+  # njh_comorbidities,
+  # njh_allergens,
+  # njh_hcru,
+  # njh_exacerbations,
+  # njh_asthma_control,
+  # njh_spirometry,
+  # njh_biomarkers,
+  # njh_medications,
   njh_biologics,
-  file = here::here("datasets", "qisar2_njh_srd.Rdata")
+  file = here::here("datasets", "qisar2_srd_njh.Rdata")
 )
