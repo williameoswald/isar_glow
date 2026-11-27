@@ -106,12 +106,9 @@ isar_biologics <- isar$medications_labelled |>
 isar_bx_cln_exclusions <- isar$patient_labelled |>
   filter_out(country %in% c("Denmark", "UK", "Italy", "Portugal")) |>
   filter_out(str_detect(patient_id, "NJH")) |>
+  filter_out(str_detect(patient_id, "SITETEZ")) |>
   remove_empty_imputation_fields() |>
   select(-data_capture_system) |>
-  # left_join(
-  #   index_dates |> select(patient_id, index_date),
-  #   by = join_by(patient_id)
-  # ) |>
   #   Demographics - add age and index_date, confirm the latter
   left_join(
     isar$demographics_labelled |>
@@ -126,29 +123,13 @@ isar_bx_cln_exclusions <- isar$patient_labelled |>
   #   Left join to keep patients without biologic data for consort
   left_join(
     isar_biologics |>
-      #   Reverse imputation for now
       mutate(
-        # bx_start_date = structure(
-        #   case_when(
-        #     bx_stdate_imputed_flag == "Date missing, visit date imputed" ~ NA,
-        #     TRUE ~ bx_stdate
-        #   ),
-        #   label = "Biologic start date"
-        # ),
-        # bx_end_date = structure(
-        #   case_when(
-        #     bx_endate_imputed_flag ==
-        #       "New prescription at next visit, next prescription start date imputed" ~ NA,
-        #     TRUE ~ bx_endate
-        #   ),
-        #   label = "Biologic end date"
-        # ),
         #   Exclude imputed months AND days
         exclude_imp_date = case_when(
           bx_start_date_imputed_flag == "MonthsDays" ~ TRUE,
           bx_end_date_imputed_flag == "MonthsDays" ~ TRUE
         ),
-        bx_flag = TRUE
+        bx_data = TRUE
       ),
     by = "patient_id",
     relationship = "one-to-many"
@@ -159,12 +140,12 @@ isar_bx_cln_exclusions <- isar$patient_labelled |>
   mutate(
     # Missing bx name but not dates - empty rows dropped above
     err1 = case_when(
-      any(bx_flag) &
+      any(bx_data) &
         is.na(bx_name) ~ "missing_bx_name_not_dates"
     ),
     # Missing start date
     err2 = case_when(
-      any(bx_flag) &
+      any(bx_data) &
         is.na(bx_start_date) ~ "missing_bx_start_date"
     ),
     # err3 = case_when(
@@ -174,17 +155,17 @@ isar_bx_cln_exclusions <- isar$patient_labelled |>
     # ),
     # Later biologic starts before end of previous
     err4 = case_when(
-      any(bx_flag) &
+      any(bx_data) &
         bx_start_date <
           dplyr::lag(bx_end_date) ~ "later_bx_start_before_prior_end"
     ),
     # Biologic ends before start
     err5 = case_when(
-      any(bx_flag) &
+      any(bx_data) &
         bx_end_date < bx_start_date ~ "end_before_start"
     ),
     err6 = case_when(
-      any(bx_flag) &
+      any(bx_data) &
         any(
           duplicated(
             pick(bx_start_date) |>
@@ -194,7 +175,7 @@ isar_bx_cln_exclusions <- isar$patient_labelled |>
     ),
     # Duplicate start dates within patient and biologic
     err7 = case_when(
-      any(bx_flag) &
+      any(bx_data) &
         any(
           duplicated(
             pick(bx_name, bx_start_date) |>
@@ -204,17 +185,17 @@ isar_bx_cln_exclusions <- isar$patient_labelled |>
     ),
     # Multiple recordings of same biologic (ie doses), ignores possible gaps
     err8 = case_when(
-      any(bx_flag) &
+      any(bx_data) &
         n() > 1 &
         n_distinct(bx_name, na.rm = TRUE) == 1 ~ "multiple_same_bx"
     ),
     err9 = case_when(
-      any(bx_flag) &
+      any(bx_data) &
         n() > 1 &
         all(is.na(bx_end_date)) ~ ">1 record, no end dates"
     ),
     err10 = case_when(
-      any(bx_flag) &
+      any(bx_data) &
         n() > 1 &
         !last(is.na(bx_end_date)) &
         any(is.na(bx_end_date)) ~ ">1 record, missing not-last end date"
@@ -228,59 +209,71 @@ isar_bx_cln_exclusions <- isar$patient_labelled |>
   fill(contains("err"), .direction = "downup") |>
   unite("errors", contains("err"), sep = ", ", na.rm = T, remove = F) |>
   mutate(
-    bx_initiation_year = year(bx_start_date),
-    bx_initiation_age = interval(ymd(date_of_birth), min(bx_start_date)) /
+    bx_initiation_date = if (all(is.na(bx_start_date))) {
+      as.Date(NA)
+    } else {
+      min(bx_start_date, na.rm = T)
+    },
+    bx_initiation_year = year(bx_initiation_date),
+    bx_initiation_age = interval(ymd(date_of_birth), bx_initiation_date) /
       years(1),
-    follow_up_mos = if_else(
-      is.na(bx_start_date),
-      NA,
-      interval(min(bx_start_date, na.rm = TRUE), last_visit_date) / months(1)
-    ),
+    age_at_baseline = interval(
+      ymd(date_of_birth),
+      bx_initiation_date %m-% months(12)
+    ) /
+      years(1),
+    follow_up_mos = interval(bx_initiation_date, last_visit_date) / months(1),
     exclusions = case_when(
-      all(is.na(bx_flag)) ~ "Not in biologic data",
+      all(is.na(bx_data)) ~ "No biologic information",
       all(num_of_visits == 0) ~ "No visits recorded", # means no visit dates for imputation
       country %in% c("Ecuador", "Qatar") ~ "Fewer than two biologics available",
-      any(bx_initiation_year < 2016) ~ "Biologic start date before 2016",
-      bx_initiation_age < 18 ~ "Under-18",
-      any(is.na(bx_name)) ~ "Biologic name not listed",
-      any(is.na(bx_start_date)) ~ "Biologic start date not listed",
+      any(is.na(bx_name)) ~ "Missing biologic name",
+      any(is.na(bx_start_date)) ~ "Missing start date",
       any(exclude_imp_date) ~ "Imputed start/end MonthsDays",
-      # max(1:n()) > 6 ~ "More than 6 listed treatments",
       any(errors != "") ~ "Flagged errors",
-      follow_up_mos < 3 ~ "Less than 3 months of follow-up",
+      age_at_baseline <
+        18 ~ "Under-18 at baseline, 12 months prior to initiation",
+      any(bx_initiation_year < 2016) ~ "Started biologic before 2016",
+      # max(1:n()) > 6 ~ "More than 6 listed treatments",
+      follow_up_mos < 3 ~ "<3 months post-initiation follow-up",
+      # Add patient-specific data queries here by setting as NA before flagging as eligible:
       patient_id == "CAN_S11_14" ~ NA, # 2017 Teze patient
+      patient_id == "CAN_S2_20" ~ NA, # Bad DOB
+      patient_id == "BEL_SITE1_363" ~ NA, # Ended initial and switched to next biologic long after last visit
+      patient_id == "MEX_SITE13_12282" ~ NA, # DOB in 1899
       .default = "Eligible"
     ) |>
       factor(
         levels = c(
-          "Not in biologic data",
+          "No biologic information",
           "No visits recorded",
           "Fewer than two biologics available",
-          "Biologic start date before 2016",
-          "Under-18",
-          "Biologic name not listed",
-          "Biologic start date not listed",
+          "Missing biologic name",
+          "Missing start date",
           "Imputed start/end MonthsDays",
           # "More than 6 listed treatments",
           "Flagged errors",
-          "Less than 3 months of follow-up",
+          "Under-18 at baseline, 12 months prior to initiation",
+          "Started biologic before 2016",
+          "<3 months post-initiation follow-up",
           "Eligible"
         )
       ),
     exclusions_table = case_when(
-      exclusions == "Not in biologic data" ~ "Non-biologic patient",
-      exclusions == "Under-18" ~ "Under-18",
+      exclusions == "No biologic information" ~ "No biologic information",
+      exclusions ==
+        "Under-18 at baseline, 12 months prior to initiation" ~ "Under-18",
       exclusions == "Non-biologic naive" ~ "Non-biologic naive",
       exclusions ==
-        "Biologic start date before 2016" ~ "Started biologic before 2016",
+        "Started biologic before 2016" ~ "Started biologic before 2016",
       exclusions ==
-        "Less than 3 months of follow-up" ~ "<3 months post-initiation follow-up",
+        "<3 months post-initiation follow-up" ~ "<3 months post-initiation follow-up",
       exclusions == "Eligible" ~ "Eligible",
       .default = "Data queries"
     ) |>
       factor(
         levels = c(
-          "Non-biologic patient",
+          "No biologic information",
           "Under-18",
           "Non-biologic naive",
           "Data queries",
@@ -306,7 +299,7 @@ bx_cln |>
   ) |>
   filter(index_year != index_year_chk) # empty set
 
-error_summary <- bx_cln |>
+error_summary <- isar_bx_cln_exclusions |>
   distinct(patient_id, .keep_all = T) |>
   filter(errors != "") |>
   select(-errors) |>
@@ -343,7 +336,7 @@ isar_bx_cln_exclusions |>
 
 ## Analysis ----
 isar_bx_analysis <- isar_bx_cln_exclusions |>
-  # Drop patients with errors
+  # Exclude patients with errors
   filter(
     when_any(
       exclusions == "Eligible"
@@ -355,7 +348,7 @@ isar_bx_analysis <- isar_bx_cln_exclusions |>
   relocate(data_capture_system = version, .after = patient_id) |>
   select(
     -bx_name,
-    -bx_flag,
+    -bx_data,
     -contains("err"),
     # -contains("exclu")
   ) |>
